@@ -1,0 +1,19 @@
+# /etc/systemd/system/control-plane.service
+[Unit]
+Description=Hosto Control Plane
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/control
+EnvironmentFile=/opt/control/.env
+ExecStart=/opt/control/control-plane
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
