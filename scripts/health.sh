@@ -95,20 +95,29 @@ fi
 # Active site containers
 # Replace the active sites container check section
 ACTIVE_SITES=$($MYSQL "SELECT s.site, j.type FROM sites s JOIN jobs j ON s.job_id = j.id WHERE s.status='ACTIVE';")
-while IFS=$'\t' read -r site type; do
-  if [ "$type" = "STATIC_PROVISION" ]; then
-    CONTAINER="static_${site}"
-  else
-    CONTAINER="php_${site}"
-  fi
-  STATUS=$($DOCKER inspect "$CONTAINER" --format '{{.State.Status}}' 2>/dev/null)
-  if [ "$STATUS" = "running" ]; then
-    pass "$CONTAINER running"
-  else
-    fail "$CONTAINER expected ACTIVE but container is '$STATUS'"
-  fi
-done <<< "$ACTIVE_SITES"
+if [ -z "$ACTIVE_SITES" ]; then
+  echo "  No active sites"
+else
+  while IFS=$'\t' read -r site type; do
+    if [ -z "$site" ]; then
+      continue
+    fi
 
+    if [ "$type" = "STATIC_PROVISION" ]; then
+      CONTAINER="static_${site}"
+    else
+      CONTAINER="php_${site}"
+    fi
+
+    STATUS=$($DOCKER inspect "$CONTAINER" --format '{{.State.Status}}')
+
+    if [ "$STATUS" = "running" ]; then
+      pass "$CONTAINER running"
+    else
+      fail "$CONTAINER expected ACTIVE but container is '$STATUS'"
+    fi
+  done <<< "$ACTIVE_SITES"
+fi
 # MySQL connectivity
 if $MYSQL "SELECT 1;" > /dev/null 2>&1; then
   pass "MySQL connection to state-01"
