@@ -119,10 +119,25 @@ func (a *API) handleRemoveCustomDomain(c *gin.Context) {
 }
 
 func (a *API) regenerateNginx(site, defaultDomain, customDomain string) error {
+    // Check job type to determine nginx config format
+    existing, err := a.db.GetSite(site)
+    if err != nil {
+        return err
+    }
+
+    job, err := a.db.GetJob(existing.JobID)
+    if err != nil {
+        return err
+    }
+
+    if job.Type == JobStaticProvision {
+        sp := NewStaticProvisioner(a.docker, a.cfg)
+        return sp.writeNginxConfig(site, "static_"+site, defaultDomain, customDomain)
+    }
+
     p := NewProvisioner(a.docker, a.cfg)
     return p.writeNginxConfig(site, "php_"+site, defaultDomain, customDomain)
 }
-
 // POST /api/static/provision
 func (a *API) handleStaticProvision(c *gin.Context) {
 	site := strings.ToLower(c.PostForm("site"))

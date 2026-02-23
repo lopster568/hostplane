@@ -193,26 +193,13 @@ func (p *StaticProvisioner) createContainer(nginxName, volumeName string) error 
 	return p.docker.ContainerStart(ctx, resp.ID, types.ContainerStartOptions{})
 }
 
-func (p *StaticProvisioner) writeNginxConfig(site, nginxName, domain string) error {
-	conf := fmt.Sprintf(`server {
-    listen 80;
-    server_name %s;
-    root /usr/share/nginx/html;
-    index index.html;
-
-    location / {
-        try_files $uri $uri/ /index.html;
+func (p *StaticProvisioner) writeNginxConfig(site, nginxName, defaultDomain string, customDomain ...string) error {
+    serverName := defaultDomain
+    if len(customDomain) > 0 && customDomain[0] != "" {
+        serverName = defaultDomain + " " + customDomain[0]
     }
 
-    location ~ /\.ht {
-        deny all;
-    }
-}
-`, domain, nginxName)
-
-	// Note: static sites use nginx container directly, no PHP
-	// We proxy to the static nginx container
-	conf = fmt.Sprintf(`server {
+    conf := fmt.Sprintf(`server {
     listen 80;
     server_name %s;
 
@@ -222,22 +209,22 @@ func (p *StaticProvisioner) writeNginxConfig(site, nginxName, domain string) err
         proxy_set_header X-Real-IP $remote_addr;
     }
 }
-`, domain, nginxName)
+`, serverName, nginxName)
 
-	var buf bytes.Buffer
-	tw := tar.NewWriter(&buf)
-	content := []byte(conf)
-	tw.WriteHeader(&tar.Header{
-		Name: site + ".conf",
-		Mode: 0644,
-		Size: int64(len(content)),
-	})
-	tw.Write(content)
-	tw.Close()
+    var buf bytes.Buffer
+    tw := tar.NewWriter(&buf)
+    content := []byte(conf)
+    tw.WriteHeader(&tar.Header{
+        Name: site + ".conf",
+        Mode: 0644,
+        Size: int64(len(content)),
+    })
+    tw.Write(content)
+    tw.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+    ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+    defer cancel()
 
-	return p.docker.CopyToContainer(ctx, p.cfg.NginxContainer,
-		p.cfg.NginxConfDir, &buf, types.CopyToContainerOptions{})
+    return p.docker.CopyToContainer(ctx, p.cfg.NginxContainer,
+        p.cfg.NginxConfDir, &buf, types.CopyToContainerOptions{})
 }

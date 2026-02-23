@@ -5,7 +5,7 @@ import (
     "os"
     "os/exec"
     "strings"
-
+    "time"
     "gopkg.in/yaml.v3"
 )
 
@@ -35,11 +35,19 @@ func loadCloudflaredConfig() (*CloudflaredConfig, error) {
 }
 
 func saveCloudflaredConfig(cfg *CloudflaredConfig) error {
-    data, err := yaml.Marshal(cfg)
-    if err != nil {
-        return err
+    var sb strings.Builder
+    sb.WriteString(fmt.Sprintf("tunnel: %s\n", cfg.Tunnel))
+    sb.WriteString(fmt.Sprintf("credentials-file: %s\n", cfg.CredentialsFile))
+    sb.WriteString("ingress:\n")
+    for _, rule := range cfg.Ingress {
+        if rule.Hostname != "" {
+            sb.WriteString(fmt.Sprintf("  - hostname: %s\n", rule.Hostname))
+            sb.WriteString(fmt.Sprintf("    service: %s\n", rule.Service))
+        } else {
+            sb.WriteString(fmt.Sprintf("  - service: %s\n", rule.Service))
+        }
     }
-    return os.WriteFile(cloudflaredConfig, data, 0644)
+    return os.WriteFile(cloudflaredConfig, []byte(sb.String()), 0644)
 }
 
 func addTunnelRoute(domain string) error {
@@ -68,14 +76,12 @@ func updateCloudflaredConfig(domain string) error {
         return err
     }
 
-    // Check if already exists
     for _, rule := range cfg.Ingress {
         if rule.Hostname == domain {
             return nil
         }
     }
 
-    // Insert before the catch-all (last entry)
     newRule := IngressRule{
         Hostname: domain,
         Service:  "http://10.10.0.10:8080",
@@ -88,9 +94,14 @@ func updateCloudflaredConfig(domain string) error {
         return err
     }
 
-    return restartCloudflared()
-}
+    // Restart async — don't block the API response
+    go func() {
+        time.Sleep(100 * time.Millisecond)
+        restartCloudflared()
+    }()
 
+    return nil
+}
 func removeCloudflaredConfig(domain string) error {
     cfg, err := loadCloudflaredConfig()
     if err != nil {
