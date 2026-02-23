@@ -7,19 +7,21 @@ import (
 )
 
 type Worker struct {
-	db          *DB
-	provisioner *Provisioner
-	destroyer   *Destroyer
-	cfg         Config
+    db                *DB
+    provisioner       *Provisioner
+    destroyer         *Destroyer
+    staticProvisioner *StaticProvisioner
+    cfg               Config
 }
 
-func NewWorker(db *DB, provisioner *Provisioner, destroyer *Destroyer, cfg Config) *Worker {
-	return &Worker{
-		db:          db,
-		provisioner: provisioner,
-		destroyer:   destroyer,
-		cfg:         cfg,
-	}
+func NewWorker(db *DB, provisioner *Provisioner, destroyer *Destroyer, staticProvisioner *StaticProvisioner, cfg Config) *Worker {
+    return &Worker{
+        db:                db,
+        provisioner:       provisioner,
+        destroyer:         destroyer,
+        staticProvisioner: staticProvisioner,
+        cfg:               cfg,
+    }
 }
 
 func (w *Worker) Start() {
@@ -62,6 +64,13 @@ func (w *Worker) processNext() {
 		jobErr = w.provisioner.Run(job.Site)
 	case JobDestroy:
 		jobErr = w.destroyer.Run(job.Site)
+	case JobStaticProvision:
+		payload, err := w.db.GetJobPayload(job.ID)
+		if err != nil || payload == "" {
+			jobErr = fmt.Errorf("missing zip payload for job")
+		} else {
+			jobErr = w.staticProvisioner.Run(job.Site, payload)
+		}
 	default:
 		jobErr = fmt.Errorf("unknown job type: %s", job.Type)
 	}

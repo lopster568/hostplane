@@ -21,6 +21,58 @@ func NewAPI(db *DB, cfg Config) *API {
 	return &API{db: db, cfg: cfg}
 }
 
+// POST /api/static/provision
+func (a *API) handleStaticProvision(c *gin.Context) {
+	site := strings.ToLower(c.PostForm("site"))
+	if site == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "site is required"})
+		return
+	}
+	if !validSite.MatchString(site) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "site name must be lowercase letters and numbers only"})
+		return
+	}
+
+	file, err := c.FormFile("zip")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "zip file is required"})
+		return
+	}
+
+	// Save zip temporarily
+	tmpPath := "/tmp/" + site + ".zip"
+	if err := c.SaveUploadedFile(file, tmpPath); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save zip"})
+		return
+	}
+
+	jobID := uuid.New().String()
+	domain := site + "." + a.cfg.BaseDomain
+
+	if err := a.db.InsertJob(jobID, JobStaticProvision, site); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to queue job"})
+		return
+	}
+
+	if err := a.db.UpsertSite(site, domain, "PROVISIONING", jobID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to record site"})
+		return
+	}
+
+	// Store zip path in job payload so worker can find it
+	if err := a.db.SetJobPayload(jobID, tmpPath); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store payload"})
+		return
+	}
+
+	c.JSON(http.StatusAccepted, gin.H{
+		"job_id": jobID,
+		"site":   site,
+		"domain": domain,
+		"status": "PENDING",
+	})
+}
+
 func (a *API) RegisterRoutes(r *gin.Engine) {
 	r.Use(a.authMiddleware())
 
@@ -34,7 +86,8 @@ func (a *API) RegisterRoutes(r *gin.Engine) {
 		v1.GET("/sites", a.handleListSites)	
 		v1.DELETE("/sites/:site", a.handleDeleteSite)
 		v1.DELETE("/jobs/:id",    a.handleDeleteJob)
-}
+		v1.POST("/static/provision", a.handleStaticProvision)
+	}
 }
 
 // POST /api/provision

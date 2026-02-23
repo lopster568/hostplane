@@ -48,10 +48,10 @@ func main() {
 
 	// ── Wire up components ───────────────────────────────────────────
 	provisioner := NewProvisioner(docker, cfg)
+	staticProvisioner := NewStaticProvisioner(docker, cfg)
 	destroyer   := NewDestroyer(docker, cfg)
-	worker      := NewWorker(db, provisioner, destroyer, cfg)
-
-	go worker.Start()
+	worker := NewWorker(db, provisioner, destroyer, staticProvisioner, cfg)	
+go worker.Start()
 	log.Println("[main] worker started")
 
 	// ── HTTP API ─────────────────────────────────────────────────────

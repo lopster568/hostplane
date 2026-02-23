@@ -4,12 +4,22 @@ import (
     "database/sql"
     "fmt"
     "time"
-
+    "strings"
     _ "github.com/go-sql-driver/mysql"
 )
 
 type JobType   string
 type JobStatus string
+
+const (
+	JobProvision       JobType = "PROVISION"
+	JobDestroy         JobType = "DESTROY"
+	JobStaticProvision JobType = "STATIC_PROVISION"
+	 StatusPending    JobStatus = "PENDING"
+    StatusProcessing JobStatus = "PROCESSING"
+    StatusCompleted  JobStatus = "COMPLETED"
+    StatusFailed     JobStatus = "FAILED"
+)
 
 type Site struct {
 	Site      string
@@ -18,6 +28,23 @@ type Site struct {
 	JobID     string
 	CreatedAt time.Time
 	UpdatedAt time.Time
+}
+
+func (d *DB) SetJobPayload(jobID, payload string) error {
+	_, err := d.conn.Exec(`UPDATE jobs SET error=? WHERE id=?`, "payload:"+payload, jobID)
+	return err
+}
+
+func (d *DB) GetJobPayload(jobID string) (string, error) {
+	var val sql.NullString
+	err := d.conn.QueryRow(`SELECT error FROM jobs WHERE id=?`, jobID).Scan(&val)
+	if err != nil {
+		return "", err
+	}
+	if val.Valid && strings.HasPrefix(val.String, "payload:") {
+		return strings.TrimPrefix(val.String, "payload:"), nil
+	}
+	return "", nil
 }
 
 func (d *DB) HardDeleteSite(site string) error {
@@ -70,16 +97,6 @@ func (d *DB) GetSite(site string) (*Site, error) {
 	}
 	return &s, nil
 }
-
-const (
-    JobProvision JobType = "PROVISION"
-    JobDestroy   JobType = "DESTROY"
-
-    StatusPending    JobStatus = "PENDING"
-    StatusProcessing JobStatus = "PROCESSING"
-    StatusCompleted  JobStatus = "COMPLETED"
-    StatusFailed     JobStatus = "FAILED"
-)
 
 type Job struct {
     ID          string
