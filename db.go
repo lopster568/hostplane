@@ -4,7 +4,6 @@ import (
     "database/sql"
     "fmt"
     "time"
-    "strings"
     _ "github.com/go-sql-driver/mysql"
 )
 
@@ -30,21 +29,33 @@ type Site struct {
 	UpdatedAt time.Time
 }
 
+func (d *DB) FailJob(jobID, site string, jobErr error) error {
+    msg := jobErr.Error()
+    _, err := d.conn.Exec(`
+        UPDATE jobs SET status='FAILED', error=?, updated_at=NOW() WHERE id=?
+    `, msg, jobID)
+    if err != nil {
+        return err
+    }
+    // Mark site as FAILED so it's visible and cleanable
+    return d.UpdateSiteStatus(site, "FAILED")
+}
+
 func (d *DB) SetJobPayload(jobID, payload string) error {
-	_, err := d.conn.Exec(`UPDATE jobs SET error=? WHERE id=?`, "payload:"+payload, jobID)
-	return err
+    _, err := d.conn.Exec(`UPDATE jobs SET payload=? WHERE id=?`, payload, jobID)
+    return err
 }
 
 func (d *DB) GetJobPayload(jobID string) (string, error) {
-	var val sql.NullString
-	err := d.conn.QueryRow(`SELECT error FROM jobs WHERE id=?`, jobID).Scan(&val)
-	if err != nil {
-		return "", err
-	}
-	if val.Valid && strings.HasPrefix(val.String, "payload:") {
-		return strings.TrimPrefix(val.String, "payload:"), nil
-	}
-	return "", nil
+    var val sql.NullString
+    err := d.conn.QueryRow(`SELECT payload FROM jobs WHERE id=?`, jobID).Scan(&val)
+    if err != nil {
+        return "", err
+    }
+    if val.Valid {
+        return val.String, nil
+    }
+    return "", nil
 }
 
 func (d *DB) HardDeleteSite(site string) error {
@@ -221,20 +232,6 @@ func (d *DB) CompleteJob(jobID, site string, jobType JobType) error {
         finalSiteStatus = "DESTROYED"
     }
     return d.UpdateSiteStatus(site, finalSiteStatus)
-}
-
-// FailJob marks job as FAILED and stores the error
-func (d *DB) FailJob(jobID, site string, jobErr error) error {
-    msg := jobErr.Error()
-    _, err := d.conn.Exec(`
-        UPDATE jobs
-        SET status='FAILED', error=?, updated_at=NOW()
-        WHERE id=?
-    `, msg, jobID)
-    if err != nil {
-        return err
-    }
-    return d.UpdateSiteStatus(site, "PROVISIONING") // leave it in limbo, needs manual review
 }
 
 // GetJob fetches a job by ID for status polling
