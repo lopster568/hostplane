@@ -49,8 +49,21 @@ func (a *API) handleSetCustomDomain(c *gin.Context) {
         return
     }
 
+    // Regenerate nginx config
     if err := a.regenerateNginx(site, existing.Domain, req.Domain); err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": "domain saved but nginx failed: " + err.Error()})
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "nginx update failed: " + err.Error()})
+        return
+    }
+
+    // Add to cloudflare tunnel
+    if err := addTunnelRoute(req.Domain); err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "tunnel route failed: " + err.Error()})
+        return
+    }
+
+    // Update config.yml and restart cloudflared
+    if err := updateCloudflaredConfig(req.Domain); err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "cloudflared config failed: " + err.Error()})
         return
     }
 
@@ -71,6 +84,12 @@ func (a *API) handleRemoveCustomDomain(c *gin.Context) {
         c.JSON(http.StatusNotFound, gin.H{"error": "site not found"})
         return
     }
+    if existing.CustomDomain == "" {
+        c.JSON(http.StatusBadRequest, gin.H{"error": "no custom domain set"})
+        return
+    }
+
+    customDomain := existing.CustomDomain
 
     if err := a.db.RemoveCustomDomain(site); err != nil {
         c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to remove domain"})
@@ -78,7 +97,17 @@ func (a *API) handleRemoveCustomDomain(c *gin.Context) {
     }
 
     if err := a.regenerateNginx(site, existing.Domain, ""); err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": "domain removed but nginx failed: " + err.Error()})
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "nginx update failed: " + err.Error()})
+        return
+    }
+
+    if err := removeTunnelRoute(customDomain); err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "tunnel route removal failed: " + err.Error()})
+        return
+    }
+
+    if err := removeCloudflaredConfig(customDomain); err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "cloudflared config removal failed: " + err.Error()})
         return
     }
 

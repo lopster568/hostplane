@@ -27,6 +27,7 @@ type Site struct {
 	JobID     string
 	CreatedAt time.Time
 	UpdatedAt time.Time
+	CustomDomain string
 }
 
 func (d *DB) SetCustomDomain(site, domain string) error {
@@ -90,37 +91,37 @@ func (d *DB) HardDeleteJob(id string) error {
 	return err
 }
 
-func (d *DB) ListSites() ([]Site, error) {
-	rows, err := d.conn.Query(`
-		SELECT site, domain, status, COALESCE(job_id, ''), created_at, updated_at
-		FROM sites ORDER BY created_at DESC
-	`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var sites []Site
-	for rows.Next() {
-		var s Site
-		if err := rows.Scan(&s.Site, &s.Domain, &s.Status, &s.JobID, &s.CreatedAt, &s.UpdatedAt); err != nil {
-			return nil, err
-		}
-		sites = append(sites, s)
-	}
-	return sites, nil
+func (d *DB) GetSite(site string) (*Site, error) {
+    var s Site
+    err := d.conn.QueryRow(`
+        SELECT site, domain, COALESCE(custom_domain,''), status, COALESCE(job_id,''), created_at, updated_at
+        FROM sites WHERE site=?
+    `, site).Scan(&s.Site, &s.Domain, &s.CustomDomain, &s.Status, &s.JobID, &s.CreatedAt, &s.UpdatedAt)
+    if err != nil {
+        return nil, err
+    }
+    return &s, nil
 }
 
-func (d *DB) GetSite(site string) (*Site, error) {
-	var s Site
-	err := d.conn.QueryRow(`
-		SELECT site, domain, status, COALESCE(job_id, ''), created_at, updated_at
-		FROM sites WHERE site=?
-	`, site).Scan(&s.Site, &s.Domain, &s.Status, &s.JobID, &s.CreatedAt, &s.UpdatedAt)
-	if err != nil {
-		return nil, err
-	}
-	return &s, nil
+func (d *DB) ListSites() ([]Site, error) {
+    rows, err := d.conn.Query(`
+        SELECT site, domain, COALESCE(custom_domain,''), status, COALESCE(job_id,''), created_at, updated_at
+        FROM sites ORDER BY created_at DESC
+    `)
+    if err != nil {
+        return nil, err
+    }
+    defer rows.Close()
+
+    var sites []Site
+    for rows.Next() {
+        var s Site
+        if err := rows.Scan(&s.Site, &s.Domain, &s.CustomDomain, &s.Status, &s.JobID, &s.CreatedAt, &s.UpdatedAt); err != nil {
+            return nil, err
+        }
+        sites = append(sites, s)
+    }
+    return sites, nil
 }
 
 type Job struct {

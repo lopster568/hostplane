@@ -40,6 +40,31 @@ else
   fail "cloudflared service DOWN"
 fi
 
+echo ""
+echo "[ CUSTOM DOMAINS ]"
+
+CUSTOM_DOMAINS=$($MYSQL "SELECT site, custom_domain FROM sites WHERE custom_domain IS NOT NULL AND status='ACTIVE';")
+
+if [ -z "$CUSTOM_DOMAINS" ]; then
+  echo -e "  No custom domains configured"
+else
+  while IFS=$'\t' read -r site domain; do
+    # Check if domain is in cloudflared config
+    if grep -q "$domain" /etc/cloudflared/config.yml; then
+      pass "$domain → $site (tunnel configured)"
+    else
+      fail "$domain → $site (MISSING from tunnel config)"
+    fi
+    # Check DNS resolves
+    RESOLVED=$(dig +short "$domain" 2>/dev/null | head -1)
+    if [ -n "$RESOLVED" ]; then
+      pass "$domain resolves to $RESOLVED"
+    else
+      warn "$domain DNS not resolving yet"
+    fi
+  done <<< "$CUSTOM_DOMAINS"
+fi
+
 # API responding
 HEALTH=$(curl -s -o /dev/null -w "%{http_code}" \
   -H "X-API-Key: $(grep API_KEY /opt/control/.env | grep -v '#' | cut -d= -f2)" \
