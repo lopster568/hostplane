@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
-
+	"github.com/docker/docker/client"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
@@ -13,12 +13,85 @@ import (
 var validSite = regexp.MustCompile(`^[a-z0-9]+$`)
 
 type API struct {
-	db  *DB
-	cfg Config
+    db     *DB
+    cfg    Config
+    docker *client.Client
 }
 
-func NewAPI(db *DB, cfg Config) *API {
-	return &API{db: db, cfg: cfg}
+func NewAPI(db *DB, cfg Config, docker *client.Client) *API {
+    return &API{db: db, cfg: cfg, docker: docker}
+}
+
+// POST /api/sites/:site/domain
+func (a *API) handleSetCustomDomain(c *gin.Context) {
+    site := c.Param("site")
+
+    var req struct {
+        Domain string `json:"domain" binding:"required"`
+    }
+    if err := c.ShouldBindJSON(&req); err != nil {
+        c.JSON(http.StatusBadRequest, gin.H{"error": "domain is required"})
+        return
+    }
+
+    existing, err := a.db.GetSite(site)
+    if err != nil {
+        c.JSON(http.StatusNotFound, gin.H{"error": "site not found"})
+        return
+    }
+    if existing.Status != "ACTIVE" {
+        c.JSON(http.StatusConflict, gin.H{"error": "site must be ACTIVE"})
+        return
+    }
+
+    if err := a.db.SetCustomDomain(site, req.Domain); err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save domain"})
+        return
+    }
+
+    if err := a.regenerateNginx(site, existing.Domain, req.Domain); err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "domain saved but nginx failed: " + err.Error()})
+        return
+    }
+
+    c.JSON(http.StatusOK, gin.H{
+        "site":           site,
+        "default_domain": existing.Domain,
+        "custom_domain":  req.Domain,
+        "status":         "active",
+    })
+}
+
+// DELETE /api/sites/:site/domain
+func (a *API) handleRemoveCustomDomain(c *gin.Context) {
+    site := c.Param("site")
+
+    existing, err := a.db.GetSite(site)
+    if err != nil {
+        c.JSON(http.StatusNotFound, gin.H{"error": "site not found"})
+        return
+    }
+
+    if err := a.db.RemoveCustomDomain(site); err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to remove domain"})
+        return
+    }
+
+    if err := a.regenerateNginx(site, existing.Domain, ""); err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "domain removed but nginx failed: " + err.Error()})
+        return
+    }
+
+    c.JSON(http.StatusOK, gin.H{
+        "site":   site,
+        "domain": existing.Domain,
+        "status": "custom domain removed",
+    })
+}
+
+func (a *API) regenerateNginx(site, defaultDomain, customDomain string) error {
+    p := NewProvisioner(a.docker, a.cfg)
+    return p.writeNginxConfig(site, "php_"+site, defaultDomain, customDomain)
 }
 
 // POST /api/static/provision
@@ -87,6 +160,8 @@ func (a *API) RegisterRoutes(r *gin.Engine) {
 		v1.DELETE("/sites/:site", a.handleDeleteSite)
 		v1.DELETE("/jobs/:id",    a.handleDeleteJob)
 		v1.POST("/static/provision", a.handleStaticProvision)
+		v1.POST("/sites/:site/domain", a.handleSetCustomDomain)
+v1.DELETE("/sites/:site/domain", a.handleRemoveCustomDomain)
 	}
 }
 

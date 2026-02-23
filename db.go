@@ -29,6 +29,20 @@ type Site struct {
 	UpdatedAt time.Time
 }
 
+func (d *DB) SetCustomDomain(site, domain string) error {
+    _, err := d.conn.Exec(`
+        UPDATE sites SET custom_domain=?, updated_at=NOW() WHERE site=?
+    `, domain, site)
+    return err
+}
+
+func (d *DB) RemoveCustomDomain(site string) error {
+    _, err := d.conn.Exec(`
+        UPDATE sites SET custom_domain=NULL, updated_at=NOW() WHERE site=?
+    `, site)
+    return err
+}
+
 func (d *DB) FailJob(jobID, site string, jobErr error) error {
     msg := jobErr.Error()
     _, err := d.conn.Exec(`

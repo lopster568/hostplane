@@ -2,7 +2,7 @@ package main
 
 import (
 	"archive/tar"
-	"bytes"
+    	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
@@ -207,8 +207,13 @@ func (p *Provisioner) createContainer(phpName, volumeName, dbName, dbUser, dbPas
 	return p.docker.ContainerStart(ctx, resp.ID, types.ContainerStartOptions{})
 }
 
-func (p *Provisioner) writeNginxConfig(site, phpName, domain string) error {
-	conf := fmt.Sprintf(`server {
+func (p *Provisioner) writeNginxConfig(site, phpName, defaultDomain string, customDomain ...string) error {
+    serverName := defaultDomain
+    if len(customDomain) > 0 && customDomain[0] != "" {
+        serverName = defaultDomain + " " + customDomain[0]
+    }
+
+    conf := fmt.Sprintf(`server {
     listen 80;
     server_name %s;
     root /var/www/html;
@@ -229,32 +234,22 @@ func (p *Provisioner) writeNginxConfig(site, phpName, domain string) error {
         deny all;
     }
 }
-`, domain, phpName)
+`, serverName, phpName)
 
-	// Create a tar archive containing the config file
-	// Docker CopyToContainer expects a tar stream
-	var buf bytes.Buffer
-	tw := tar.NewWriter(&buf)
-	content := []byte(conf)
-	err := tw.WriteHeader(&tar.Header{
-		Name: site + ".conf",
-		Mode: 0644,
-		Size: int64(len(content)),
-	})
-	if err != nil {
-		return err
-	}
-	if _, err := tw.Write(content); err != nil {
-		return err
-	}
-	tw.Close()
+    var buf bytes.Buffer
+    tw := tar.NewWriter(&buf)
+    content := []byte(conf)
+    tw.WriteHeader(&tar.Header{
+        Name: site + ".conf",
+        Mode: 0644,
+        Size: int64(len(content)),
+    })
+    tw.Write(content)
+    tw.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+    ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+    defer cancel()
 
-	return p.docker.CopyToContainer(ctx, p.cfg.NginxContainer,
-		p.cfg.NginxConfDir,
-		&buf,
-		types.CopyToContainerOptions{},
-	)
+    return p.docker.CopyToContainer(ctx, p.cfg.NginxContainer,
+        p.cfg.NginxConfDir, &buf, types.CopyToContainerOptions{})
 }

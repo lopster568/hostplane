@@ -60,7 +60,7 @@ go worker.Start()
 	router.Use(gin.Logger())
 	router.Use(gin.Recovery())
 
-	api := NewAPI(db, cfg)
+	api := NewAPI(db, cfg, docker)
 	api.RegisterRoutes(router)
 
 	srv := &http.Server{
