@@ -32,6 +32,8 @@ func (a *API) RegisterRoutes(r *gin.Engine) {
 		v1.GET("/sites/:site", a.handleSiteStatus)
 		v1.GET("/health",     a.handleHealth)
 		v1.GET("/sites", a.handleListSites)	
+		v1.DELETE("/sites/:site", a.handleDeleteSite)
+		v1.DELETE("/jobs/:id",    a.handleDeleteJob)
 }
 }
 
@@ -103,6 +105,50 @@ func (a *API) handleListSites(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"sites": sites})
+}
+
+// DELETE /api/sites/:site
+func (a *API) handleDeleteSite(c *gin.Context) {
+	site := c.Param("site")
+
+	existing, err := a.db.GetSite(site)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "site not found"})
+		return
+	}
+	if existing.Status != "DESTROYED" {
+		c.JSON(http.StatusConflict, gin.H{"error": "site must be DESTROYED before hard delete"})
+		return
+	}
+
+	if err := a.db.HardDeleteSite(site); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete site"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"deleted": site})
+}
+
+// DELETE /api/jobs/:id
+func (a *API) handleDeleteJob(c *gin.Context) {
+	id := c.Param("id")
+
+	job, err := a.db.GetJob(id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "job not found"})
+		return
+	}
+	if job.Status == StatusProcessing || job.Status == StatusPending {
+		c.JSON(http.StatusConflict, gin.H{"error": "cannot delete active job"})
+		return
+	}
+
+	if err := a.db.HardDeleteJob(id); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete job"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"deleted": id})
 }
 
 // POST /api/destroy

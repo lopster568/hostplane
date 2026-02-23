@@ -20,6 +20,24 @@ type Site struct {
 	UpdatedAt time.Time
 }
 
+func (d *DB) HardDeleteSite(site string) error {
+	_, err := d.conn.Exec(`
+		DELETE FROM jobs WHERE site=?;
+	`, site)
+	if err != nil {
+		return err
+	}
+	_, err = d.conn.Exec(`
+		DELETE FROM sites WHERE site=?;
+	`, site)
+	return err
+}
+
+func (d *DB) HardDeleteJob(id string) error {
+	_, err := d.conn.Exec(`DELETE FROM jobs WHERE id=?`, id)
+	return err
+}
+
 func (d *DB) ListSites() ([]Site, error) {
 	rows, err := d.conn.Query(`
 		SELECT site, domain, status, COALESCE(job_id, ''), created_at, updated_at
