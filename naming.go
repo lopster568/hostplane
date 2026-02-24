@@ -38,4 +38,3 @@ func SiteDomain(site, baseDomain string) string {
 func CaddyConfFile(site string) string {
 	return site + ".caddy"
 }
-
