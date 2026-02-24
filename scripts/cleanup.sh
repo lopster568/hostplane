@@ -22,19 +22,25 @@ echo "[ DESTROYED / FAILED SITES ]"
 
 DEAD_SITES=$($MYSQL "SELECT site FROM sites WHERE status IN ('DESTROYED','FAILED');")
 
-if [ -z "$DEAD_SITES" ]; then
-  echo -e "${GREEN}✓${NC} No destroyed/failed sites to clean up"
+# Also catch PROVISIONING sites whose job has exhausted all retries (stuck ghosts)
+STRANDED=$($MYSQL "SELECT s.site FROM sites s JOIN jobs j ON s.job_id = j.id WHERE s.status='PROVISIONING' AND j.status='FAILED';")
+
+ALL_DEAD=$(echo -e "$DEAD_SITES\n$STRANDED" | sort -u | grep -v '^$')
+
+if [ -z "$ALL_DEAD" ]; then
+  echo -e "${GREEN}✓${NC} No destroyed/failed/stranded sites to clean up"
 else
   echo "Sites to remove:"
-  for site in $DEAD_SITES; do
+  for site in $ALL_DEAD; do
     STATUS=$($MYSQL "SELECT status FROM sites WHERE site='$site';")
+    JOB_STATUS=$($MYSQL "SELECT COALESCE(j.status,'?') FROM sites s LEFT JOIN jobs j ON s.job_id=j.id WHERE s.site='$site';")
     CUSTOM=$($MYSQL "SELECT COALESCE(custom_domain,'') FROM sites WHERE site='$site';")
-    echo "  - $site ($STATUS)$([ -n "$CUSTOM" ] && echo " (custom: $CUSTOM)")"
+    echo "  - $site (site: $STATUS, job: $JOB_STATUS)$([ -n "$CUSTOM" ] && echo " (custom: $CUSTOM)")"
   done
   echo ""
-  read -p "Delete all destroyed/failed sites and their jobs from DB? [y/N] " confirm
+  read -p "Delete all dead/stranded sites and their jobs from DB? [y/N] " confirm
   if [ "$confirm" = "y" ]; then
-    for site in $DEAD_SITES; do
+    for site in $ALL_DEAD; do
       CUSTOM=$($MYSQL "SELECT COALESCE(custom_domain,'') FROM sites WHERE site='$site';")
 
       mysql --defaults-file=/root/.my-hosto.cnf controlplane -e "
