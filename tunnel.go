@@ -1,133 +1,170 @@
 package main
 
 import (
-    "fmt"
-    "os"
-    "os/exec"
-    "strings"
-    "time"
-    "gopkg.in/yaml.v3"
+	"bytes"
+	"fmt"
+	"log"
+	"os"
+	"os/exec"
+	"strings"
+
+	"gopkg.in/yaml.v3"
 )
 
-const cloudflaredConfig = "/etc/cloudflared/config.yml"
+// TunnelManager manages Cloudflare tunnel configuration and DNS routes.
+// All methods use configurable paths from Config — no hard-coded constants.
+type TunnelManager struct {
+	cfg Config
+}
+
+func NewTunnelManager(cfg Config) *TunnelManager {
+	return &TunnelManager{cfg: cfg}
+}
 
 type CloudflaredConfig struct {
-    Tunnel          string        `yaml:"tunnel"`
-    CredentialsFile string        `yaml:"credentials-file"`
-    Ingress         []IngressRule `yaml:"ingress"`
+	Tunnel          string        `yaml:"tunnel"`
+	CredentialsFile string        `yaml:"credentials-file"`
+	Ingress         []IngressRule `yaml:"ingress"`
 }
 
 type IngressRule struct {
-    Hostname string `yaml:"hostname,omitempty"`
-    Service  string `yaml:"service"`
+	Hostname string `yaml:"hostname,omitempty"`
+	Service  string `yaml:"service"`
 }
 
-func loadCloudflaredConfig() (*CloudflaredConfig, error) {
-    data, err := os.ReadFile(cloudflaredConfig)
-    if err != nil {
-        return nil, err
-    }
-    var cfg CloudflaredConfig
-    if err := yaml.Unmarshal(data, &cfg); err != nil {
-        return nil, err
-    }
-    return &cfg, nil
+func (tm *TunnelManager) loadConfig() (*CloudflaredConfig, error) {
+	data, err := os.ReadFile(tm.cfg.CloudflaredConfigPath)
+	if err != nil {
+		return nil, fmt.Errorf("read cloudflared config %s: %w", tm.cfg.CloudflaredConfigPath, err)
+	}
+	var cfg CloudflaredConfig
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("parse cloudflared config: %w", err)
+	}
+	return &cfg, nil
 }
 
-func saveCloudflaredConfig(cfg *CloudflaredConfig) error {
-    var sb strings.Builder
-    sb.WriteString(fmt.Sprintf("tunnel: %s\n", cfg.Tunnel))
-    sb.WriteString(fmt.Sprintf("credentials-file: %s\n", cfg.CredentialsFile))
-    sb.WriteString("ingress:\n")
-    for _, rule := range cfg.Ingress {
-        if rule.Hostname != "" {
-            sb.WriteString(fmt.Sprintf("  - hostname: %s\n", rule.Hostname))
-            sb.WriteString(fmt.Sprintf("    service: %s\n", rule.Service))
-        } else {
-            sb.WriteString(fmt.Sprintf("  - service: %s\n", rule.Service))
-        }
-    }
-    return os.WriteFile(cloudflaredConfig, []byte(sb.String()), 0644)
+// saveConfig writes the cloudflared config atomically using yaml.Marshal.
+// Writes to a temp file first, then renames to avoid partial writes.
+func (tm *TunnelManager) saveConfig(cfg *CloudflaredConfig) error {
+	var buf bytes.Buffer
+	enc := yaml.NewEncoder(&buf)
+	enc.SetIndent(2)
+	if err := enc.Encode(cfg); err != nil {
+		return fmt.Errorf("marshal cloudflared config: %w", err)
+	}
+	enc.Close()
+
+	tmpPath := tm.cfg.CloudflaredConfigPath + ".tmp"
+	if err := os.WriteFile(tmpPath, buf.Bytes(), 0644); err != nil {
+		return fmt.Errorf("write temp config %s: %w", tmpPath, err)
+	}
+	if err := os.Rename(tmpPath, tm.cfg.CloudflaredConfigPath); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("rename config: %w", err)
+	}
+	return nil
 }
 
-func addTunnelRoute(domain string) error {
-    cmd := exec.Command("cloudflared", "tunnel", "route", "dns", "hosto", domain)
-    out, err := cmd.CombinedOutput()
-    if err != nil {
-        // Ignore already exists error
-        if strings.Contains(string(out), "already exists") {
-            return nil
-        }
-        return fmt.Errorf("cloudflared route dns: %s", string(out))
-    }
-    return nil
+// AddRoute creates a DNS CNAME for the domain pointing to the tunnel.
+// Idempotent — returns nil if the route already exists.
+func (tm *TunnelManager) AddRoute(domain string) error {
+	cmd := exec.Command("cloudflared", "tunnel", "route", "dns", tm.cfg.TunnelName, domain)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		if strings.Contains(string(out), "already exists") {
+			log.Printf("[tunnel] DNS route for %s already exists, skipping", domain)
+			return nil
+		}
+		return fmt.Errorf("cloudflared route dns: %s", string(out))
+	}
+	log.Printf("[tunnel] added DNS route for %s", domain)
+	return nil
 }
 
-func removeTunnelRoute(domain string) error {
-    // Cloudflare doesn't have a CLI delete for tunnel DNS routes
-    // it must be done via API or manually — we just remove from config
-    // The CNAME in customer's DNS will just 404 once removed from ingress
-    return nil
+// RemoveRoute removes a DNS route. Currently a no-op because the cloudflared CLI
+// does not support route deletion — requires Cloudflare API.
+func (tm *TunnelManager) RemoveRoute(domain string) error {
+	log.Printf("[tunnel] DNS route removal for %s requires manual Cloudflare API call", domain)
+	return nil
 }
 
-func updateCloudflaredConfig(domain string) error {
-    cfg, err := loadCloudflaredConfig()
-    if err != nil {
-        return err
-    }
+// UpdateConfig adds a domain to the cloudflared ingress and restarts synchronously.
+// Idempotent — skips if the domain is already present.
+func (tm *TunnelManager) UpdateConfig(domain string) error {
+	cfg, err := tm.loadConfig()
+	if err != nil {
+		return err
+	}
 
-    for _, rule := range cfg.Ingress {
-        if rule.Hostname == domain {
-            return nil
-        }
-    }
+	// Idempotent check
+	for _, rule := range cfg.Ingress {
+		if rule.Hostname == domain {
+			log.Printf("[tunnel] domain %s already in config, skipping", domain)
+			return nil
+		}
+	}
 
-    newRule := IngressRule{
-        Hostname: domain,
-        Service:  "http://10.10.0.10:8080",
-    }
+	newRule := IngressRule{
+		Hostname: domain,
+		Service:  tm.cfg.ServiceTarget,
+	}
 
-    catchAll := cfg.Ingress[len(cfg.Ingress)-1]
-    cfg.Ingress = append(cfg.Ingress[:len(cfg.Ingress)-1], newRule, catchAll)
+	// Insert before catch-all (last entry)
+	if len(cfg.Ingress) > 0 {
+		catchAll := cfg.Ingress[len(cfg.Ingress)-1]
+		cfg.Ingress = append(cfg.Ingress[:len(cfg.Ingress)-1], newRule, catchAll)
+	} else {
+		cfg.Ingress = append(cfg.Ingress, newRule, IngressRule{Service: "http_status:404"})
+	}
 
-    if err := saveCloudflaredConfig(cfg); err != nil {
-        return err
-    }
+	if err := tm.saveConfig(cfg); err != nil {
+		return err
+	}
 
-    // Restart async — don't block the API response
-    go func() {
-        time.Sleep(100 * time.Millisecond)
-        restartCloudflared()
-    }()
-
-    return nil
+	log.Printf("[tunnel] added %s to config, restarting cloudflared", domain)
+	return restartCloudflared()
 }
-func removeCloudflaredConfig(domain string) error {
-    cfg, err := loadCloudflaredConfig()
-    if err != nil {
-        return err
-    }
 
-    var updated []IngressRule
-    for _, rule := range cfg.Ingress {
-        if rule.Hostname != domain {
-            updated = append(updated, rule)
-        }
-    }
-    cfg.Ingress = updated
+// RemoveConfig removes a domain from the cloudflared ingress and restarts synchronously.
+// Idempotent — no-op if the domain is not present.
+func (tm *TunnelManager) RemoveConfig(domain string) error {
+	cfg, err := tm.loadConfig()
+	if err != nil {
+		return err
+	}
 
-    if err := saveCloudflaredConfig(cfg); err != nil {
-        return err
-    }
+	var updated []IngressRule
+	found := false
+	for _, rule := range cfg.Ingress {
+		if rule.Hostname != domain {
+			updated = append(updated, rule)
+		} else {
+			found = true
+		}
+	}
 
-    return restartCloudflared()
+	if !found {
+		log.Printf("[tunnel] domain %s not in config, nothing to remove", domain)
+		return nil
+	}
+
+	cfg.Ingress = updated
+
+	if err := tm.saveConfig(cfg); err != nil {
+		return err
+	}
+
+	log.Printf("[tunnel] removed %s from config, restarting cloudflared", domain)
+	return restartCloudflared()
 }
 
 func restartCloudflared() error {
-    cmd := exec.Command("systemctl", "restart", "cloudflared")
-    out, err := cmd.CombinedOutput()
-    if err != nil {
-        return fmt.Errorf("restart cloudflared: %s", string(out))
-    }
-    return nil
+	cmd := exec.Command("systemctl", "restart", "cloudflared")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("restart cloudflared: %s", string(out))
+	}
+	log.Println("[tunnel] cloudflared restarted successfully")
+	return nil
 }

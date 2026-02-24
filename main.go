@@ -49,9 +49,9 @@ func main() {
 	// ── Wire up components ───────────────────────────────────────────
 	provisioner := NewProvisioner(docker, cfg)
 	staticProvisioner := NewStaticProvisioner(docker, cfg)
-	destroyer   := NewDestroyer(docker, cfg)
-	worker := NewWorker(db, provisioner, destroyer, staticProvisioner, cfg)	
-go worker.Start()
+	destroyer := NewDestroyer(docker, cfg)
+	worker := NewWorker(db, provisioner, destroyer, staticProvisioner, cfg)
+	go worker.Start()
 	log.Println("[main] worker started")
 
 	// ── HTTP API ─────────────────────────────────────────────────────
@@ -60,7 +60,8 @@ go worker.Start()
 	router.Use(gin.Logger())
 	router.Use(gin.Recovery())
 
-	api := NewAPI(db, cfg, docker)
+	tunnel := NewTunnelManager(cfg)
+	api := NewAPI(db, cfg, docker, tunnel)
 	api.RegisterRoutes(router)
 
 	srv := &http.Server{

@@ -2,9 +2,11 @@ package main
 
 import (
 	"database/sql"
+	"log"
 	"net/http"
 	"regexp"
 	"strings"
+
 	"github.com/docker/docker/client"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -13,131 +15,185 @@ import (
 var validSite = regexp.MustCompile(`^[a-z0-9]+$`)
 
 type API struct {
-    db     *DB
-    cfg    Config
-    docker *client.Client
+	db     *DB
+	cfg    Config
+	docker *client.Client
+	tunnel *TunnelManager
 }
 
-func NewAPI(db *DB, cfg Config, docker *client.Client) *API {
-    return &API{db: db, cfg: cfg, docker: docker}
+func NewAPI(db *DB, cfg Config, docker *client.Client, tunnel *TunnelManager) *API {
+	return &API{db: db, cfg: cfg, docker: docker, tunnel: tunnel}
 }
 
 // POST /api/sites/:site/domain
+//
+// Flow: Validate → Apply Infra → Confirm → Commit DB
+// DB is only written AFTER all infrastructure changes succeed.
+// On partial failure, completed infra steps are rolled back.
 func (a *API) handleSetCustomDomain(c *gin.Context) {
-    site := c.Param("site")
+	site := c.Param("site")
 
-    var req struct {
-        Domain string `json:"domain" binding:"required"`
-    }
-    if err := c.ShouldBindJSON(&req); err != nil {
-        c.JSON(http.StatusBadRequest, gin.H{"error": "domain is required"})
-        return
-    }
+	var req struct {
+		Domain string `json:"domain" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "domain is required"})
+		return
+	}
 
-    existing, err := a.db.GetSite(site)
-    if err != nil {
-        c.JSON(http.StatusNotFound, gin.H{"error": "site not found"})
-        return
-    }
-    if existing.Status != "ACTIVE" {
-        c.JSON(http.StatusConflict, gin.H{"error": "site must be ACTIVE"})
-        return
-    }
+	domain := strings.ToLower(strings.TrimSpace(req.Domain))
 
-    if err := a.db.SetCustomDomain(site, req.Domain); err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save domain"})
-        return
-    }
+	// ── Validate ─────────────────────────────────────────────────────
+	if err := ValidateCustomDomain(domain, a.cfg.BaseDomain); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 
-    // Regenerate nginx config
-    if err := a.regenerateNginx(site, existing.Domain, req.Domain); err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": "nginx update failed: " + err.Error()})
-        return
-    }
+	if err := a.db.EnsureDomainAvailable(domain, site); err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		return
+	}
 
-    // Add to cloudflare tunnel
-    if err := addTunnelRoute(req.Domain); err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": "tunnel route failed: " + err.Error()})
-        return
-    }
+	existing, err := a.db.GetSite(site)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "site not found"})
+		return
+	}
+	if existing.Status != "ACTIVE" && existing.Status != "DOMAIN_ACTIVE" {
+		c.JSON(http.StatusConflict, gin.H{"error": "site must be ACTIVE to set custom domain"})
+		return
+	}
 
-    // Update config.yml and restart cloudflared
-    if err := updateCloudflaredConfig(req.Domain); err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": "cloudflared config failed: " + err.Error()})
-        return
-    }
+	// Idempotent: if domain is already set to this value, no-op
+	if existing.CustomDomain == domain {
+		c.JSON(http.StatusOK, gin.H{
+			"site":          site,
+			"custom_domain": domain,
+			"status":        existing.Status,
+			"message":       "domain already set",
+		})
+		return
+	}
 
-    c.JSON(http.StatusOK, gin.H{
-        "site":           site,
-        "default_domain": existing.Domain,
-        "custom_domain":  req.Domain,
-        "status":         "active",
-    })
+	// ── Apply Infra FIRST ────────────────────────────────────────────
+	// Step 1: Regenerate nginx config with new domain
+	if err := a.regenerateNginx(site, existing.Domain, domain); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "nginx update failed: " + err.Error()})
+		return
+	}
+
+	// Step 2: Add tunnel DNS route
+	if err := a.tunnel.AddRoute(domain); err != nil {
+		// Rollback step 1: restore previous nginx config
+		a.regenerateNginx(site, existing.Domain, existing.CustomDomain)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "tunnel route failed: " + err.Error()})
+		return
+	}
+
+	// Step 3: Update cloudflared config and restart (synchronous)
+	if err := a.tunnel.UpdateConfig(domain); err != nil {
+		// Rollback steps 1-2
+		a.tunnel.RemoveRoute(domain)
+		a.regenerateNginx(site, existing.Domain, existing.CustomDomain)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "cloudflared config failed: " + err.Error()})
+		return
+	}
+
+	// ── Commit DB state LAST ─────────────────────────────────────────
+	if err := a.db.SetCustomDomain(site, domain); err != nil {
+		// Infra is applied but DB commit failed — infra is correct state,
+		// next retry or reconcile will pick this up
+		log.Printf("[CRITICAL] site=%s domain=%s infra applied but DB commit failed: %v", site, domain, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "domain applied but failed to persist — retry the request"})
+		return
+	}
+
+	log.Printf("[api] site=%s custom domain set to %s", site, domain)
+	c.JSON(http.StatusOK, gin.H{
+		"site":           site,
+		"default_domain": existing.Domain,
+		"custom_domain":  domain,
+		"status":         "active",
+	})
 }
 
 // DELETE /api/sites/:site/domain
+//
+// Flow: Validate → Remove Infra → Confirm → Commit DB
+// Infra is torn down BEFORE the DB record is updated.
+// If infra removal succeeds but DB fails, the domain is safely unrouted
+// and a retry will converge.
 func (a *API) handleRemoveCustomDomain(c *gin.Context) {
-    site := c.Param("site")
+	site := c.Param("site")
 
-    existing, err := a.db.GetSite(site)
-    if err != nil {
-        c.JSON(http.StatusNotFound, gin.H{"error": "site not found"})
-        return
-    }
-    if existing.CustomDomain == "" {
-        c.JSON(http.StatusBadRequest, gin.H{"error": "no custom domain set"})
-        return
-    }
+	existing, err := a.db.GetSite(site)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "site not found"})
+		return
+	}
+	if existing.CustomDomain == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "no custom domain set"})
+		return
+	}
 
-    customDomain := existing.CustomDomain
+	customDomain := existing.CustomDomain
 
-    if err := a.db.RemoveCustomDomain(site); err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to remove domain"})
-        return
-    }
+	// ── Remove Infra FIRST ───────────────────────────────────────────
+	// Step 1: Regenerate nginx config without the custom domain
+	if err := a.regenerateNginx(site, existing.Domain, ""); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "nginx update failed: " + err.Error()})
+		return
+	}
 
-    if err := a.regenerateNginx(site, existing.Domain, ""); err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": "nginx update failed: " + err.Error()})
-        return
-    }
+	// Step 2: Remove from cloudflared config and restart (synchronous)
+	if err := a.tunnel.RemoveConfig(customDomain); err != nil {
+		// Rollback step 1: restore nginx with the custom domain
+		a.regenerateNginx(site, existing.Domain, customDomain)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "cloudflared config removal failed: " + err.Error()})
+		return
+	}
 
-    if err := removeTunnelRoute(customDomain); err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": "tunnel route removal failed: " + err.Error()})
-        return
-    }
+	// Step 3: Remove tunnel DNS route (best-effort, currently requires API)
+	if err := a.tunnel.RemoveRoute(customDomain); err != nil {
+		log.Printf("[WARN] site=%s tunnel route removal for %s failed: %v", site, customDomain, err)
+	}
 
-    if err := removeCloudflaredConfig(customDomain); err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": "cloudflared config removal failed: " + err.Error()})
-        return
-    }
+	// ── Commit DB state LAST ─────────────────────────────────────────
+	if err := a.db.RemoveCustomDomain(site); err != nil {
+		log.Printf("[CRITICAL] site=%s domain=%s infra removed but DB commit failed: %v", site, customDomain, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "domain unrouted but failed to persist — retry the request"})
+		return
+	}
 
-    c.JSON(http.StatusOK, gin.H{
-        "site":   site,
-        "domain": existing.Domain,
-        "status": "custom domain removed",
-    })
+	log.Printf("[api] site=%s custom domain %s removed", site, customDomain)
+	c.JSON(http.StatusOK, gin.H{
+		"site":   site,
+		"domain": existing.Domain,
+		"status": "custom domain removed",
+	})
 }
 
 func (a *API) regenerateNginx(site, defaultDomain, customDomain string) error {
-    // Check job type to determine nginx config format
-    existing, err := a.db.GetSite(site)
-    if err != nil {
-        return err
-    }
+	// Check job type to determine nginx config format
+	existing, err := a.db.GetSite(site)
+	if err != nil {
+		return err
+	}
 
-    job, err := a.db.GetJob(existing.JobID)
-    if err != nil {
-        return err
-    }
+	job, err := a.db.GetJob(existing.JobID)
+	if err != nil {
+		return err
+	}
 
-    if job.Type == JobStaticProvision {
-        sp := NewStaticProvisioner(a.docker, a.cfg)
-        return sp.writeNginxConfig(site, "static_"+site, defaultDomain, customDomain)
-    }
+	if job.Type == JobStaticProvision {
+		sp := NewStaticProvisioner(a.docker, a.cfg)
+		return sp.writeNginxConfig(site, StaticContainerName(site), defaultDomain, customDomain)
+	}
 
-    p := NewProvisioner(a.docker, a.cfg)
-    return p.writeNginxConfig(site, "php_"+site, defaultDomain, customDomain)
+	p := NewProvisioner(a.docker, a.cfg)
+	return p.writeNginxConfig(site, PHPContainerName(site), defaultDomain, customDomain)
 }
+
 // POST /api/static/provision
 func (a *API) handleStaticProvision(c *gin.Context) {
 	site := strings.ToLower(c.PostForm("site"))
@@ -147,6 +203,28 @@ func (a *API) handleStaticProvision(c *gin.Context) {
 	}
 	if !validSite.MatchString(site) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "site name must be lowercase letters and numbers only"})
+		return
+	}
+
+	// Reject if site already has an active job
+	active, err := a.db.HasActiveJob(site)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check job status"})
+		return
+	}
+	if active {
+		c.JSON(http.StatusConflict, gin.H{"error": "site already has a pending or processing job"})
+		return
+	}
+
+	// Reject if site is already active
+	existingSite, err := a.db.GetSite(site)
+	if err != nil && err != sql.ErrNoRows {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check site status"})
+		return
+	}
+	if existingSite != nil && existingSite.Status == "ACTIVE" {
+		c.JSON(http.StatusConflict, gin.H{"error": "site already exists and is active"})
 		return
 	}
 
@@ -164,7 +242,7 @@ func (a *API) handleStaticProvision(c *gin.Context) {
 	}
 
 	jobID := uuid.New().String()
-	domain := site + "." + a.cfg.BaseDomain
+	domain := SiteDomain(site, a.cfg.BaseDomain)
 
 	if err := a.db.InsertJob(jobID, JobStaticProvision, site); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to queue job"})
@@ -196,16 +274,16 @@ func (a *API) RegisterRoutes(r *gin.Engine) {
 	v1 := r.Group("/api")
 	{
 		v1.POST("/provision", a.handleProvision)
-		v1.POST("/destroy",   a.handleDestroy)
-		v1.GET("/jobs/:id",   a.handleJobStatus)
+		v1.POST("/destroy", a.handleDestroy)
+		v1.GET("/jobs/:id", a.handleJobStatus)
 		v1.GET("/sites/:site", a.handleSiteStatus)
-		v1.GET("/health",     a.handleHealth)
-		v1.GET("/sites", a.handleListSites)	
+		v1.GET("/health", a.handleHealth)
+		v1.GET("/sites", a.handleListSites)
 		v1.DELETE("/sites/:site", a.handleDeleteSite)
-		v1.DELETE("/jobs/:id",    a.handleDeleteJob)
+		v1.DELETE("/jobs/:id", a.handleDeleteJob)
 		v1.POST("/static/provision", a.handleStaticProvision)
 		v1.POST("/sites/:site/domain", a.handleSetCustomDomain)
-v1.DELETE("/sites/:site/domain", a.handleRemoveCustomDomain)
+		v1.DELETE("/sites/:site/domain", a.handleRemoveCustomDomain)
 	}
 }
 
@@ -249,7 +327,7 @@ func (a *API) handleProvision(c *gin.Context) {
 	}
 
 	jobID := uuid.New().String()
-	domain := site + "." + a.cfg.BaseDomain
+	domain := SiteDomain(site, a.cfg.BaseDomain)
 
 	if err := a.db.InsertJob(jobID, JobProvision, site); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to queue job"})
