@@ -25,9 +25,14 @@ func (d *Destroyer) Run(site string) error {
 	dbUser := WPDatabaseUser(site)
 	volumeName := VolumeName(site)
 	phpName := PHPContainerName(site)
+	nginxName := NginxContainerName(site)
 
+	// Stop and remove both containers before touching the shared volume
 	if err := d.removeContainer(phpName); err != nil {
-		return fmt.Errorf("removeContainer: %w", err)
+		return fmt.Errorf("removePhpContainer: %w", err)
+	}
+	if err := d.removeContainer(nginxName); err != nil {
+		return fmt.Errorf("removeNginxContainer: %w", err)
 	}
 	if err := d.removeVolume(volumeName); err != nil {
 		return fmt.Errorf("removeVolume: %w", err)

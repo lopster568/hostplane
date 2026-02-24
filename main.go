@@ -48,7 +48,7 @@ func main() {
 
 	// ── Wire up components ───────────────────────────────────────────
 	tunnel := NewTunnelManager(cfg)
-	provisioner := NewProvisioner(docker, cfg, tunnel)
+	provisioner := NewProvisioner(docker, cfg)
 	staticProvisioner := NewStaticProvisioner(docker, cfg)
 	destroyer := NewDestroyer(docker, cfg)
 	worker := NewWorker(db, provisioner, destroyer, staticProvisioner, cfg)

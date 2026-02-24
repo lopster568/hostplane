@@ -21,11 +21,10 @@ import (
 type Provisioner struct {
 	docker *client.Client
 	cfg    Config
-	tunnel *TunnelManager
 }
 
-func NewProvisioner(docker *client.Client, cfg Config, tunnel *TunnelManager) *Provisioner {
-	return &Provisioner{docker: docker, cfg: cfg, tunnel: tunnel}
+func NewProvisioner(docker *client.Client, cfg Config) *Provisioner {
+	return &Provisioner{docker: docker, cfg: cfg}
 }
 
 func (p *Provisioner) Run(site string) error {
@@ -34,25 +33,27 @@ func (p *Provisioner) Run(site string) error {
 	dbPass := WPDatabasePass(site)
 	volName := VolumeName(site)
 	phpName := PHPContainerName(site)
+	nginxName := NginxContainerName(site)
 	domain := SiteDomain(site, p.cfg.BaseDomain)
 
 	// Track what succeeded for rollback
-	var dbCreated, volCreated, containerCreated, caddyWritten, tunnelRouted bool
+	var dbCreated, volCreated, phpCreated, nginxCreated, caddyWritten bool
 
-	// Rollback function — runs in reverse order
+	// Rollback in reverse order
 	rollback := func(reason error) error {
 		log.Printf("[rollback] triggered for %s: %v", site, reason)
 
-		if tunnelRouted {
-			p.tunnel.RemoveConfig(domain)
-			// DNS route removal requires Cloudflare API — logged by RemoveRoute
-			p.tunnel.RemoveRoute(domain)
-		}
 		if caddyWritten {
 			p.removeCaddyConfig(site)
 			reloadCaddy(p.cfg)
 		}
-		if containerCreated {
+		if nginxCreated {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			p.docker.ContainerStop(ctx, nginxName, container.StopOptions{})
+			p.docker.ContainerRemove(ctx, nginxName, types.ContainerRemoveOptions{Force: true})
+		}
+		if phpCreated {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 			p.docker.ContainerStop(ctx, phpName, container.StopOptions{})
@@ -70,44 +71,44 @@ func (p *Provisioner) Run(site string) error {
 		return fmt.Errorf("provisioning failed (rolled back): %w", reason)
 	}
 
-	// Step 1
+	// Step 1: Create database and user on state-01
 	if err := p.createDatabase(dbName, dbUser, dbPass); err != nil {
 		return rollback(fmt.Errorf("createDatabase: %w", err))
 	}
 	dbCreated = true
 
-	// Step 2
+	// Step 2: Create wp_<site> Docker volume
 	if err := p.createVolume(volName); err != nil {
 		return rollback(fmt.Errorf("createVolume: %w", err))
 	}
 	volCreated = true
 
-	// Step 3
+	// Step 3: Start PHP-FPM container (wordpress:php8.2-fpm, mounts wp_<site>)
 	if err := p.createContainer(phpName, volName, dbName, dbUser, dbPass); err != nil {
-		return rollback(fmt.Errorf("createContainer: %w", err))
+		return rollback(fmt.Errorf("createPhpContainer: %w", err))
 	}
-	containerCreated = true
+	phpCreated = true
 
-	// Step 4
-	if err := p.writeCaddyConfig(site, phpName, domain); err != nil {
+	// Step 4: Start nginx sidecar (mounts same volume, serves static + proxies PHP)
+	if err := p.createNginxContainer(nginxName, volName); err != nil {
+		return rollback(fmt.Errorf("createNginxContainer: %w", err))
+	}
+	nginxCreated = true
+
+	// Step 5: Write nginx server block into the sidecar and reload nginx
+	if err := p.writeNginxConfig(nginxName, phpName, domain); err != nil {
+		return rollback(fmt.Errorf("writeNginxConfig: %w", err))
+	}
+
+	// Step 6: Write per-site Caddy snippet (reverse_proxy → nginx sidecar)
+	if err := p.writeCaddyConfig(site, nginxName, domain); err != nil {
 		return rollback(fmt.Errorf("writeCaddyConfig: %w", err))
 	}
 	caddyWritten = true
 
-	// Step 5
+	// Step 7: Reload Caddy — site goes live instantly
 	if err := reloadCaddy(p.cfg); err != nil {
 		return rollback(fmt.Errorf("reloadCaddy: %w", err))
-	}
-
-	// Step 6: Create Cloudflare DNS CNAME for the domain → tunnel
-	if err := p.tunnel.AddRoute(domain); err != nil {
-		return rollback(fmt.Errorf("tunnel.AddRoute: %w", err))
-	}
-	tunnelRouted = true
-
-	// Step 7: Record domain in cloudflared ingress config (audit trail)
-	if err := p.tunnel.UpdateConfig(domain); err != nil {
-		return rollback(fmt.Errorf("tunnel.UpdateConfig: %w", err))
 	}
 
 	return nil
@@ -228,26 +229,15 @@ func (p *Provisioner) createContainer(phpName, volumeName, dbName, dbUser, dbPas
 }
 
 // writeCaddyConfig writes a per-site Caddy snippet into the CaddyConfDir inside
-// the Caddy container. WordPress containers speak PHP-FPM (port 9000), so we
-// use the php_fastcgi directive. The root directive sets SCRIPT_FILENAME for
-// PHP-FPM without requiring Caddy to have direct file access.
-func (p *Provisioner) writeCaddyConfig(site, phpName, defaultDomain string, customDomain ...string) error {
+// the Caddy container. Caddy simply reverse-proxies by hostname to the site's
+// nginx sidecar — no FastCGI from Caddy's side.
+func (p *Provisioner) writeCaddyConfig(site, nginxName, defaultDomain string, customDomain ...string) error {
 	hosts := defaultDomain
 	if len(customDomain) > 0 && customDomain[0] != "" {
 		hosts = defaultDomain + ", " + customDomain[0]
 	}
 
-	conf := fmt.Sprintf(`%s {
-    encode gzip
-    rewrite / /index.php
-    reverse_proxy %s:9000 {
-        transport fastcgi {
-            root /var/www/html
-            split .php
-        }
-    }
-}
-`, hosts, phpName)
+	conf := fmt.Sprintf("%s {\n    encode gzip\n    reverse_proxy %s:80\n}\n", hosts, nginxName)
 
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)
@@ -270,4 +260,109 @@ func (p *Provisioner) writeCaddyConfig(site, phpName, defaultDomain string, cust
 
 	return p.docker.CopyToContainer(ctx, p.cfg.CaddyContainer,
 		p.cfg.CaddyConfDir, &buf, types.CopyToContainerOptions{})
+}
+
+// createNginxContainer starts an nginx:alpine sidecar for a site.
+// It shares the same wp_<site> volume as the PHP-FPM container so nginx can
+// serve static assets directly. The server block is written separately via
+// writeNginxConfig after the container is running.
+func (p *Provisioner) createNginxContainer(nginxName, volumeName string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// Idempotent — container already exists, just ensure it's running
+	_, err := p.docker.ContainerInspect(ctx, nginxName)
+	if err == nil {
+		return p.docker.ContainerStart(ctx, nginxName, types.ContainerStartOptions{})
+	}
+
+	pids := int64(50)
+	resp, err := p.docker.ContainerCreate(
+		ctx,
+		&container.Config{
+			Image: "nginx:alpine",
+		},
+		&container.HostConfig{
+			RestartPolicy: container.RestartPolicy{Name: "unless-stopped"},
+			Mounts: []mount.Mount{
+				{
+					Type:     mount.TypeVolume,
+					Source:   volumeName,
+					Target:   "/var/www/html",
+					ReadOnly: true,
+				},
+			},
+			Resources: container.Resources{
+				Memory:    128 * 1024 * 1024,
+				NanoCPUs:  500_000_000,
+				PidsLimit: &pids,
+			},
+		},
+		&network.NetworkingConfig{
+			EndpointsConfig: map[string]*network.EndpointSettings{
+				p.cfg.DockerNetwork: {},
+			},
+		},
+		nil,
+		nginxName,
+	)
+	if err != nil {
+		return fmt.Errorf("nginx container create: %w", err)
+	}
+
+	return p.docker.ContainerStart(ctx, resp.ID, types.ContainerStartOptions{})
+}
+
+// writeNginxConfig injects the nginx server block into the running nginx_<site>
+// sidecar container and reloads nginx. The config routes static file requests
+// directly from the WordPress volume and proxies PHP to the FPM container.
+func (p *Provisioner) writeNginxConfig(nginxName, phpName, domain string) error {
+	conf := fmt.Sprintf(`server {
+    listen 80;
+    root /var/www/html;
+    index index.php;
+
+    location / {
+        try_files $uri $uri/ /index.php?$args;
+    }
+
+    location ~ \.php$ {
+        fastcgi_pass %s:9000;
+        fastcgi_index index.php;
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        fastcgi_param HTTPS on;
+        fastcgi_param HTTP_HOST %s;
+    }
+}
+`, phpName, domain)
+
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	content := []byte(conf)
+	tw.WriteHeader(&tar.Header{
+		Name:    "default.conf",
+		Mode:    0644,
+		Size:    int64(len(content)),
+		ModTime: time.Now(),
+	})
+	tw.Write(content)
+	tw.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	if err := p.docker.CopyToContainer(ctx, nginxName,
+		"/etc/nginx/conf.d/", &buf, types.CopyToContainerOptions{}); err != nil {
+		return fmt.Errorf("copy nginx config: %w", err)
+	}
+
+	// Reload nginx to apply the new server block
+	execResp, err := p.docker.ContainerExecCreate(ctx, nginxName, types.ExecConfig{
+		Cmd: []string{"nginx", "-s", "reload"},
+	})
+	if err != nil {
+		return fmt.Errorf("nginx reload exec create: %w", err)
+	}
+	return p.docker.ContainerExecStart(ctx, execResp.ID, types.ExecStartCheck{})
 }

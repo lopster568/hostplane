@@ -38,3 +38,13 @@ func SiteDomain(site, baseDomain string) string {
 func CaddyConfFile(site string) string {
 	return site + ".caddy"
 }
+
+// NginxContainerName returns the Docker container name for a site's nginx sidecar.
+func NginxContainerName(site string) string {
+	return "nginx_" + site
+}
+
+// NginxConfFile returns the nginx server block filename for a site.
+func NginxConfFile(site string) string {
+	return site + ".conf"
+}
