@@ -232,9 +232,10 @@ func (p *Provisioner) writeCaddyConfig(site, phpName, defaultDomain string, cust
 	tw := tar.NewWriter(&buf)
 	content := []byte(conf)
 	tw.WriteHeader(&tar.Header{
-		Name: CaddyConfFile(site),
-		Mode: 0644,
-		Size: int64(len(content)),
+		Name:    CaddyConfFile(site),
+		Mode:    0644,
+		Size:    int64(len(content)),
+		ModTime: time.Now(),
 	})
 	tw.Write(content)
 	tw.Close()
