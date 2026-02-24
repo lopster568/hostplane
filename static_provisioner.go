@@ -254,11 +254,12 @@ func (p *StaticProvisioner) writeNginxConfig(site, nginxName, defaultDomain stri
 
     location / {
         proxy_pass http://%s:80;
-        proxy_set_header Host $host;
+        proxy_set_header Host %s;
         proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-Host $host;
     }
 }
-`, serverName, nginxName)
+`, serverName, nginxName, defaultDomain)
 
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)
