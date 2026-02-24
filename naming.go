@@ -44,9 +44,9 @@ func SiteDomain(site, baseDomain string) string {
 	return site + "." + baseDomain
 }
 
-// NginxConfFile returns the nginx config filename for a site.
-func NginxConfFile(site string) string {
-	return site + ".conf"
+// CaddyConfFile returns the Caddy snippet filename for a site.
+func CaddyConfFile(site string) string {
+	return site + ".caddy"
 }
 
 // ContainerNameForType returns the appropriate container name based on job type.

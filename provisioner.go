@@ -36,15 +36,15 @@ func (p *Provisioner) Run(site string) error {
 	domain := SiteDomain(site, p.cfg.BaseDomain)
 
 	// Track what succeeded for rollback
-	var dbCreated, volCreated, containerCreated, nginxWritten bool
+	var dbCreated, volCreated, containerCreated, caddyWritten bool
 
 	// Rollback function — runs in reverse order
 	rollback := func(reason error) error {
 		log.Printf("[rollback] triggered for %s: %v", site, reason)
 
-		if nginxWritten {
-			p.removeNginxConfig(site)
-			reloadNginx(p.cfg)
+		if caddyWritten {
+			p.removeCaddyConfig(site)
+			reloadCaddy(p.cfg)
 		}
 		if containerCreated {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -83,14 +83,14 @@ func (p *Provisioner) Run(site string) error {
 	containerCreated = true
 
 	// Step 4
-	if err := p.writeNginxConfig(site, phpName, domain); err != nil {
-		return rollback(fmt.Errorf("writeNginxConfig: %w", err))
+	if err := p.writeCaddyConfig(site, phpName, domain); err != nil {
+		return rollback(fmt.Errorf("writeCaddyConfig: %w", err))
 	}
-	nginxWritten = true
+	caddyWritten = true
 
 	// Step 5
-	if err := reloadNginx(p.cfg); err != nil {
-		return rollback(fmt.Errorf("reloadNginx: %w", err))
+	if err := reloadCaddy(p.cfg); err != nil {
+		return rollback(fmt.Errorf("reloadCaddy: %w", err))
 	}
 
 	return nil
@@ -108,19 +108,20 @@ func (p *Provisioner) dropDatabase(dbName, dbUser string) {
 	log.Printf("[rollback] dropped DB %s and user %s", dbName, dbUser)
 }
 
-func (p *Provisioner) removeNginxConfig(site string) {
+func (p *Provisioner) removeCaddyConfig(site string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	execResp, err := p.docker.ContainerExecCreate(ctx, p.cfg.NginxContainer, types.ExecConfig{
-		Cmd: []string{"rm", "-f", "/etc/nginx/conf.d/" + site + ".conf"},
+	confPath := p.cfg.CaddyConfDir + "/" + CaddyConfFile(site)
+	execResp, err := p.docker.ContainerExecCreate(ctx, p.cfg.CaddyContainer, types.ExecConfig{
+		Cmd: []string{"rm", "-f", confPath},
 	})
 	if err != nil {
-		log.Printf("[rollback] cannot create exec for nginx config removal: %v", err)
+		log.Printf("[rollback] cannot create exec for caddy config removal: %v", err)
 		return
 	}
 	p.docker.ContainerExecStart(ctx, execResp.ID, types.ExecStartCheck{})
-	log.Printf("[rollback] removed nginx config for %s", site)
+	log.Printf("[rollback] removed caddy config for %s", site)
 }
 
 func (p *Provisioner) createDatabase(dbName, dbUser, dbPass string) error {
@@ -209,40 +210,29 @@ func (p *Provisioner) createContainer(phpName, volumeName, dbName, dbUser, dbPas
 	return p.docker.ContainerStart(ctx, resp.ID, types.ContainerStartOptions{})
 }
 
-func (p *Provisioner) writeNginxConfig(site, phpName, defaultDomain string, customDomain ...string) error {
-	serverName := defaultDomain
+// writeCaddyConfig writes a per-site Caddy snippet into the CaddyConfDir inside
+// the Caddy container. WordPress containers speak PHP-FPM (port 9000), so we
+// use the php_fastcgi directive. The root directive sets SCRIPT_FILENAME for
+// PHP-FPM without requiring Caddy to have direct file access.
+func (p *Provisioner) writeCaddyConfig(site, phpName, defaultDomain string, customDomain ...string) error {
+	hosts := defaultDomain
 	if len(customDomain) > 0 && customDomain[0] != "" {
-		serverName = defaultDomain + " " + customDomain[0]
+		hosts = defaultDomain + ", " + customDomain[0]
 	}
 
-	conf := fmt.Sprintf(`server {
-    listen 80;
-    server_name %s;
-    root /var/www/html;
-    index index.php;
-
-    location / {
-        try_files $uri $uri/ /index.php?$args;
-    }
-
-    location ~ \.php$ {
-        include fastcgi_params;
-        fastcgi_pass %s:9000;
-        fastcgi_param SCRIPT_FILENAME /var/www/html$fastcgi_script_name;
-        fastcgi_param SCRIPT_NAME $fastcgi_script_name;
-    }
-
-    location ~ /\.ht {
-        deny all;
-    }
+	conf := fmt.Sprintf(`%s {
+    root * /var/www/html
+    php_fastcgi %s:9000
+    file_server
+    encode gzip
 }
-`, serverName, phpName)
+`, hosts, phpName)
 
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)
 	content := []byte(conf)
 	tw.WriteHeader(&tar.Header{
-		Name: site + ".conf",
+		Name: CaddyConfFile(site),
 		Mode: 0644,
 		Size: int64(len(content)),
 	})
@@ -252,6 +242,6 @@ func (p *Provisioner) writeNginxConfig(site, phpName, defaultDomain string, cust
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	return p.docker.CopyToContainer(ctx, p.cfg.NginxContainer,
-		p.cfg.NginxConfDir, &buf, types.CopyToContainerOptions{})
+	return p.docker.CopyToContainer(ctx, p.cfg.CaddyContainer,
+		p.cfg.CaddyConfDir, &buf, types.CopyToContainerOptions{})
 }
