@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"time"
@@ -29,30 +30,63 @@ func NewStaticProvisioner(docker *client.Client, cfg Config) *StaticProvisioner 
 }
 
 func (p *StaticProvisioner) Run(site, zipPath string) error {
-	volumeName  := "static_vol_" + site
-	nginxName   := "static_" + site
-	domain      := site + "." + p.cfg.BaseDomain
+	volumeName := StaticVolumeName(site)
+	nginxName := StaticContainerName(site)
+	domain := SiteDomain(site, p.cfg.BaseDomain)
 
+	// Track what succeeded for rollback
+	var volCreated, containerCreated, nginxWritten bool
+
+	rollback := func(reason error) error {
+		log.Printf("[rollback] triggered for static %s: %v", site, reason)
+
+		if nginxWritten {
+			p.removeNginxConfig(site)
+			reloadNginx(p.cfg)
+		}
+		if containerCreated {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			p.docker.ContainerStop(ctx, nginxName, container.StopOptions{})
+			p.docker.ContainerRemove(ctx, nginxName, types.ContainerRemoveOptions{Force: true})
+		}
+		if volCreated {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			p.docker.VolumeRemove(ctx, volumeName, true)
+		}
+
+		return fmt.Errorf("static provisioning failed (rolled back): %w", reason)
+	}
+
+	// Step 1
 	if err := p.createVolume(volumeName); err != nil {
-		return fmt.Errorf("createVolume: %w", err)
+		return rollback(fmt.Errorf("createVolume: %w", err))
 	}
+	volCreated = true
 
+	// Step 2
 	if err := p.uploadZipToVolume(volumeName, zipPath); err != nil {
-		return fmt.Errorf("uploadZip: %w", err)
+		return rollback(fmt.Errorf("uploadZip: %w", err))
 	}
 
+	// Step 3
 	if err := p.createContainer(nginxName, volumeName); err != nil {
-		return fmt.Errorf("createContainer: %w", err)
+		return rollback(fmt.Errorf("createContainer: %w", err))
 	}
+	containerCreated = true
 
 	time.Sleep(2 * time.Second)
 
+	// Step 4
 	if err := p.writeNginxConfig(site, nginxName, domain); err != nil {
-		return fmt.Errorf("writeNginxConfig: %w", err)
+		return rollback(fmt.Errorf("writeNginxConfig: %w", err))
 	}
+	nginxWritten = true
 
+	// Step 5
 	if err := reloadNginx(p.cfg); err != nil {
-		return fmt.Errorf("reloadNginx: %w", err)
+		return rollback(fmt.Errorf("reloadNginx: %w", err))
 	}
 
 	// Cleanup tmp zip
@@ -180,7 +214,7 @@ func (p *StaticProvisioner) createContainer(nginxName, volumeName string) error 
 		},
 		&network.NetworkingConfig{
 			EndpointsConfig: map[string]*network.EndpointSettings{
-				"wp_backend": {},
+				p.cfg.DockerNetwork: {},
 			},
 		},
 		nil,
@@ -193,13 +227,28 @@ func (p *StaticProvisioner) createContainer(nginxName, volumeName string) error 
 	return p.docker.ContainerStart(ctx, resp.ID, types.ContainerStartOptions{})
 }
 
-func (p *StaticProvisioner) writeNginxConfig(site, nginxName, defaultDomain string, customDomain ...string) error {
-    serverName := defaultDomain
-    if len(customDomain) > 0 && customDomain[0] != "" {
-        serverName = defaultDomain + " " + customDomain[0]
-    }
+func (p *StaticProvisioner) removeNginxConfig(site string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 
-    conf := fmt.Sprintf(`server {
+	execResp, err := p.docker.ContainerExecCreate(ctx, p.cfg.NginxContainer, types.ExecConfig{
+		Cmd: []string{"rm", "-f", "/etc/nginx/conf.d/" + NginxConfFile(site)},
+	})
+	if err != nil {
+		log.Printf("[rollback] cannot create exec for nginx config removal: %v", err)
+		return
+	}
+	p.docker.ContainerExecStart(ctx, execResp.ID, types.ExecStartCheck{})
+	log.Printf("[rollback] removed nginx config for static %s", site)
+}
+
+func (p *StaticProvisioner) writeNginxConfig(site, nginxName, defaultDomain string, customDomain ...string) error {
+	serverName := defaultDomain
+	if len(customDomain) > 0 && customDomain[0] != "" {
+		serverName = defaultDomain + " " + customDomain[0]
+	}
+
+	conf := fmt.Sprintf(`server {
     listen 80;
     server_name %s;
 
@@ -211,20 +260,20 @@ func (p *StaticProvisioner) writeNginxConfig(site, nginxName, defaultDomain stri
 }
 `, serverName, nginxName)
 
-    var buf bytes.Buffer
-    tw := tar.NewWriter(&buf)
-    content := []byte(conf)
-    tw.WriteHeader(&tar.Header{
-        Name: site + ".conf",
-        Mode: 0644,
-        Size: int64(len(content)),
-    })
-    tw.Write(content)
-    tw.Close()
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	content := []byte(conf)
+	tw.WriteHeader(&tar.Header{
+		Name: site + ".conf",
+		Mode: 0644,
+		Size: int64(len(content)),
+	})
+	tw.Write(content)
+	tw.Close()
 
-    ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-    defer cancel()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 
-    return p.docker.CopyToContainer(ctx, p.cfg.NginxContainer,
-        p.cfg.NginxConfDir, &buf, types.CopyToContainerOptions{})
+	return p.docker.CopyToContainer(ctx, p.cfg.NginxContainer,
+		p.cfg.NginxConfDir, &buf, types.CopyToContainerOptions{})
 }
