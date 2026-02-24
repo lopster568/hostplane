@@ -239,8 +239,7 @@ func (p *Provisioner) writeCaddyConfig(site, phpName, defaultDomain string, cust
 
 	conf := fmt.Sprintf(`%s {
     encode gzip
-    @notphp not path *.php
-    rewrite @notphp /index.php?{query}
+    rewrite / /index.php
     reverse_proxy %s:9000 {
         transport fastcgi {
             root /var/www/html

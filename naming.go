@@ -11,7 +11,7 @@ func PHPContainerName(site string) string {
 
 // VolumeName returns the Docker volume name for a WordPress site.
 func VolumeName(site string) string {
-	return "vol_" + site
+	return "wp_" + site
 }
 
 // WPDatabaseName returns the MySQL database name for a site.
@@ -21,7 +21,7 @@ func WPDatabaseName(site string) string {
 
 // WPDatabaseUser returns the MySQL user name for a site.
 func WPDatabaseUser(site string) string {
-	return "u_" + site
+	return "wp_" + site
 }
 
 // WPDatabasePass returns the MySQL password for a site.
