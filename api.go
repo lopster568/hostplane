@@ -190,7 +190,7 @@ func (a *API) regenerateCaddy(site, defaultDomain, customDomain string) error {
 		return sp.writeCaddyConfig(site, defaultDomain, customDomain)
 	}
 
-	p := NewProvisioner(a.docker, a.cfg)
+	p := NewProvisioner(a.docker, a.cfg, a.tunnel)
 	return p.writeCaddyConfig(site, PHPContainerName(site), defaultDomain, customDomain)
 }
 

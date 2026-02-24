@@ -21,10 +21,11 @@ import (
 type Provisioner struct {
 	docker *client.Client
 	cfg    Config
+	tunnel *TunnelManager
 }
 
-func NewProvisioner(docker *client.Client, cfg Config) *Provisioner {
-	return &Provisioner{docker: docker, cfg: cfg}
+func NewProvisioner(docker *client.Client, cfg Config, tunnel *TunnelManager) *Provisioner {
+	return &Provisioner{docker: docker, cfg: cfg, tunnel: tunnel}
 }
 
 func (p *Provisioner) Run(site string) error {
@@ -36,12 +37,17 @@ func (p *Provisioner) Run(site string) error {
 	domain := SiteDomain(site, p.cfg.BaseDomain)
 
 	// Track what succeeded for rollback
-	var dbCreated, volCreated, containerCreated, caddyWritten bool
+	var dbCreated, volCreated, containerCreated, caddyWritten, tunnelRouted bool
 
 	// Rollback function — runs in reverse order
 	rollback := func(reason error) error {
 		log.Printf("[rollback] triggered for %s: %v", site, reason)
 
+		if tunnelRouted {
+			p.tunnel.RemoveConfig(domain)
+			// DNS route removal requires Cloudflare API — logged by RemoveRoute
+			p.tunnel.RemoveRoute(domain)
+		}
 		if caddyWritten {
 			p.removeCaddyConfig(site)
 			reloadCaddy(p.cfg)
@@ -91,6 +97,17 @@ func (p *Provisioner) Run(site string) error {
 	// Step 5
 	if err := reloadCaddy(p.cfg); err != nil {
 		return rollback(fmt.Errorf("reloadCaddy: %w", err))
+	}
+
+	// Step 6: Create Cloudflare DNS CNAME for the domain → tunnel
+	if err := p.tunnel.AddRoute(domain); err != nil {
+		return rollback(fmt.Errorf("tunnel.AddRoute: %w", err))
+	}
+	tunnelRouted = true
+
+	// Step 7: Record domain in cloudflared ingress config (audit trail)
+	if err := p.tunnel.UpdateConfig(domain); err != nil {
+		return rollback(fmt.Errorf("tunnel.UpdateConfig: %w", err))
 	}
 
 	return nil

@@ -47,7 +47,8 @@ func main() {
 	log.Printf("[main] connected to docker on app-01 (containers: %d)", info.Containers)
 
 	// ── Wire up components ───────────────────────────────────────────
-	provisioner := NewProvisioner(docker, cfg)
+	tunnel := NewTunnelManager(cfg)
+	provisioner := NewProvisioner(docker, cfg, tunnel)
 	staticProvisioner := NewStaticProvisioner(docker, cfg)
 	destroyer := NewDestroyer(docker, cfg)
 	worker := NewWorker(db, provisioner, destroyer, staticProvisioner, cfg)
@@ -60,7 +61,6 @@ func main() {
 	router.Use(gin.Logger())
 	router.Use(gin.Recovery())
 
-	tunnel := NewTunnelManager(cfg)
 	api := NewAPI(db, cfg, docker, tunnel)
 	api.RegisterRoutes(router)
 
