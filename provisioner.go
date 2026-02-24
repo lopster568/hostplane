@@ -104,7 +104,7 @@ func (p *Provisioner) dropDatabase(dbName, dbUser string) {
 	}
 	defer db.Close()
 	db.Exec("DROP DATABASE IF EXISTS " + dbName)
-	db.Exec("DROP USER IF EXISTS '" + dbUser + "'@'" + p.cfg.AppServerIP + "'")
+	db.Exec("DROP USER IF EXISTS '" + dbUser + "'@'%'")
 	log.Printf("[rollback] dropped DB %s and user %s", dbName, dbUser)
 }
 
@@ -137,8 +137,8 @@ func (p *Provisioner) createDatabase(dbName, dbUser, dbPass string) error {
 
 	stmts := []string{
 		"CREATE DATABASE IF NOT EXISTS " + dbName,
-		fmt.Sprintf("CREATE USER IF NOT EXISTS '%s'@'%s' IDENTIFIED BY '%s'", dbUser, p.cfg.AppServerIP, dbPass),
-		fmt.Sprintf("GRANT ALL PRIVILEGES ON %s.* TO '%s'@'%s'", dbName, dbUser, p.cfg.AppServerIP),
+		fmt.Sprintf("CREATE USER IF NOT EXISTS '%s'@'%%' IDENTIFIED BY '%s'", dbUser, dbPass),
+		fmt.Sprintf("GRANT ALL PRIVILEGES ON %s.* TO '%s'@'%%'", dbName, dbUser),
 		"FLUSH PRIVILEGES",
 	}
 	for _, stmt := range stmts {
@@ -222,11 +222,12 @@ func (p *Provisioner) writeCaddyConfig(site, phpName, defaultDomain string, cust
 
 	conf := fmt.Sprintf(`%s {
     encode gzip
+    @notphp not path *.php
+    rewrite @notphp /index.php?{query}
     reverse_proxy %s:9000 {
         transport fastcgi {
             root /var/www/html
             split .php
-            index index.php
         }
     }
 }

@@ -97,7 +97,7 @@ func (d *Destroyer) dropDatabase(dbName, dbUser string) error {
 
 	stmts := []string{
 		"DROP DATABASE IF EXISTS " + dbName,
-		fmt.Sprintf("DROP USER IF EXISTS '%s'@'%s'", dbUser, d.cfg.AppServerIP),
+		fmt.Sprintf("DROP USER IF EXISTS '%s'@'%%'", dbUser),
 	}
 	for _, stmt := range stmts {
 		if _, err := db.Exec(stmt); err != nil {
