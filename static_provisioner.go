@@ -231,6 +231,10 @@ func (p *StaticProvisioner) writeCaddyConfig(site, defaultDomain string, customD
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	if err := ensureCaddyConfDir(ctx, p.docker, p.cfg.CaddyContainer, p.cfg.CaddyConfDir); err != nil {
+		return err
+	}
+
 	return p.docker.CopyToContainer(ctx, p.cfg.CaddyContainer,
 		p.cfg.CaddyConfDir, &buf, types.CopyToContainerOptions{})
 }
