@@ -1,74 +1,135 @@
-# Control-Plane Lifecycle Refactor — Context Summary
+# Hostplane — Context Summary
 
-> **Last updated: 2026-02-23** | Build: `go build` ✅ `go vet` ✅
-> Full audit history: see git log for the original 900-line analysis
+> **Last updated: 2026-02-24** | `go build` ✅
 
-## Project
+## What This Is
 
-Hostplane control-plane — Go binary that orchestrates WordPress/static site provisioning via Docker, nginx, Cloudflare tunnels, and MySQL. Files: `api.go`, `config.go`, `db.go`, `provisioner.go`, `static_provisioner.go`, `destroyer.go`, `tunnel.go`, `worker.go`, `nginx.go`, `main.go`, `naming.go`, `lifecycle.go`.
-
-## Goal
-
-Move from imperative step execution to a lifecycle-driven, state-machine-based architecture with: validated state transitions, infra-before-DB ordering, rollback on partial failure, idempotent infra providers, a reconciliation loop, and structured logging.
+Go control-plane binary (`/opt/control/control-plane`) running as a systemd service on **control-01** (LXC on Proxmox). Provisions and destroys WordPress sites on **app-01** via the Docker API over TLS. No Cloudflare Tunnel dependency.
 
 ---
 
-## What Was Done (Session 1 — 2026-02-23)
+## Infrastructure
 
-### New Files
+| Host       | Role                                      | IP             |
+| ---------- | ----------------------------------------- | -------------- |
+| control-01 | control-plane binary, scripts             | LXC internal   |
+| app-01     | Docker host — all site containers + Caddy | 10.10.0.10     |
+| state-01   | MariaDB — one DB per site                 | 10.10.0.20     |
+| VPS        | nginx TCP forwarder only (dumb, no logic) | 157.245.107.34 |
 
-- **`naming.go`** — 11 functions centralizing all resource naming (`PHPContainerName`, `StaticContainerName`, `VolumeName`, `StaticVolumeName`, `WPDatabaseName`, `WPDatabaseUser`, `WPDatabasePass`, `SiteDomain`, `NginxConfFile`, `ContainerNameForType`, `TmpUploadContainer`).
-- **`lifecycle.go`** — `SiteStatus` enum (11 states: `CREATED`, `PROVISIONING`, `ACTIVE`, `DOMAIN_PENDING`, `DOMAIN_VALIDATING`, `DOMAIN_ROUTING`, `DOMAIN_ACTIVE`, `DOMAIN_REMOVING`, `DESTROYING`, `DESTROYED`, `FAILED`), `allowedTransitions` map, `CanTransitionTo()`, helper methods (`IsValid`, `IsTerminal`, `AllowsCustomDomain`, `AllowsDestroy`), domain validation (`ValidateDomainFormat`, `ValidateDomainNotBase`, `ValidateCustomDomain`, `ValidateDomainDNS`).
-
-### Key Changes to Existing Files
-
-| File                    | What changed                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `config.go`             | +5 fields: `AppServerIP`, `DockerNetwork`, `CloudflaredConfigPath`, `TunnelName`, `ServiceTarget` (all env-configurable). No more hard-coded `10.10.0.10` or `/etc/cloudflared/config.yml` in Go code.                                                                                                                                                                                                                                        |
-| `db.go`                 | +`TransitionSite()` (validates state machine before write), +`EnsureDomainAvailable()` (domain uniqueness across active sites), +`ListCustomDomains()` (for future full-regen).                                                                                                                                                                                                                                                               |
-| `tunnel.go`             | Full rewrite → `TunnelManager` struct. `yaml.Marshal` + atomic file write (tmp → rename). All restarts synchronous (removed fire-and-forget `go func()`). All paths from `Config`. Idempotency checks + logging.                                                                                                                                                                                                                              |
-| `api.go`                | `API` struct holds `*TunnelManager`. **`handleSetCustomDomain`**: validate format/uniqueness → apply infra (nginx → tunnel → cloudflared) → commit DB last. 3-step rollback on partial failure. Idempotent no-op if domain already set. **`handleRemoveCustomDomain`**: remove infra first → commit DB last. Rollback if cloudflared removal fails. **`handleStaticProvision`**: +`HasActiveJob` + existing-ACTIVE-site guards (was missing). |
-| `provisioner.go`        | All naming via `naming.go`. IP via `cfg.AppServerIP`. Network via `cfg.DockerNetwork`.                                                                                                                                                                                                                                                                                                                                                        |
-| `destroyer.go`          | All naming via `naming.go`. IP via `cfg.AppServerIP`.                                                                                                                                                                                                                                                                                                                                                                                         |
-| `static_provisioner.go` | +Full rollback (`volCreated`, `containerCreated`, `nginxWritten` tracking + `removeNginxConfig()`). All naming via `naming.go`. Network via `cfg.DockerNetwork`.                                                                                                                                                                                                                                                                              |
-| `main.go`               | Creates `TunnelManager`, passes to `NewAPI()`.                                                                                                                                                                                                                                                                                                                                                                                                |
-
-### Original Defects Fixed
-
-1. ✅ **DB-before-infra ordering** — Domain handlers now apply infra first, commit DB last.
-2. ✅ **Missing rollback on partial domain failure** — 3-step compensation in set, 2-step in remove.
-3. ✅ **StaticProvisioner had no rollback** — Now has parity with Provisioner.
-4. ✅ **handleStaticProvision missing guards** — Has `HasActiveJob` + existing-site check.
-5. ✅ **Domain uniqueness** — `EnsureDomainAvailable()` + format validation.
-6. ✅ **Async fire-and-forget cloudflared restart** — All synchronous now.
-7. ✅ **Hard-coded IPs/paths** — All in `Config` with env-var overrides.
-8. ✅ **Scattered naming conventions** — Centralized in `naming.go`.
-9. ✅ **Hand-rolled YAML serialization** — Uses `yaml.Marshal` + atomic write.
-10. ✅ **State machine defined** — `lifecycle.go` with `CanTransitionTo()` + `TransitionSite()` DB method.
+Wildcard DNS `*.cowsaidmoo.tech → 157.245.107.34` (Cloudflare, orange cloud ON, Full Strict).
 
 ---
 
-## What Remains (Priority Order)
+## Request Path
 
-### P0 — Wire the state machine into execution paths
+```
+Browser → Cloudflare → VPS nginx (TCP fwd) → WireGuard → Caddy (app-01)
+  → reverse_proxy nginx_<site>:80
+    → nginx_<site>  (static files from volume + fastcgi_pass to FPM)
+      → php_<site>:9000  (WordPress PHP-FPM)
+        → MariaDB wp_<site> (state-01)
+```
 
-1. **DB migration** — MySQL `sites.status` column → support new enum values. Add `desired_custom_domain VARCHAR(255)`, `validated_at TIMESTAMP`, `last_reconciled_at TIMESTAMP`, `UNIQUE INDEX idx_custom_domain (custom_domain)`.
-2. **Migrate `CompleteJob`/`FailJob`** — Replace raw `UpdateSiteStatus()` calls with `TransitionSite()` so the state machine is actually enforced, not just available.
+---
 
-### P1 — Infrastructure interfaces (testability)
+## Per-Site Resources
 
-3. **Define `EdgeProvider` interface** — `ApplySite(site Site) error`, `RemoveSite(name string) error`, `RegenerateAll(sites []Site) error`.
-4. **Define `TunnelProvider` interface** — `RouteDomain(domain string) error`, `RemoveRoute(domain string) error`, `RegenerateConfig() error`.
-5. **Implement `DockerEdgeProvider`** wrapping current nginx logic behind the interface.
-6. **Wire `TunnelManager` behind `TunnelProvider`** interface.
-7. **Add `TunnelManager.RegenerateAll()`** — Full config rebuild from `ListCustomDomains()` instead of incremental patching.
-8. **Replace direct calls in provisioner/destroyer** with interface method calls.
+| Resource                | Name                                                 | Where    |
+| ----------------------- | ---------------------------------------------------- | -------- |
+| MariaDB database + user | `wp_<site>`                                          | state-01 |
+| Docker volume           | `wp_<site>`                                          | app-01   |
+| PHP-FPM container       | `php_<site>`                                         | app-01   |
+| nginx sidecar container | `nginx_<site>`                                       | app-01   |
+| nginx server block      | inside `nginx_<site>:/etc/nginx/conf.d/default.conf` | app-01   |
+| Caddy snippet           | inside `caddy:/etc/caddy/sites/<site>.caddy`         | app-01   |
 
-### P2 — Async domain lifecycle
+---
 
-9. **Refactor `handleSetCustomDomain`** to record-intent-only (set `desired_custom_domain`, transition to `DOMAIN_PENDING`, return 202).
-10. **Add domain lifecycle processing to worker** — `DOMAIN_PENDING` → validate DNS → `DOMAIN_VALIDATING` → apply routing → `DOMAIN_ROUTING` → confirm → `DOMAIN_ACTIVE`.
-11. **Refactor `handleRemoveCustomDomain`** similarly (transition to `DOMAIN_REMOVING`, worker handles teardown).
+## Key .env (control-01 `/opt/control/.env`)
+
+```
+DOCKER_HOST=tcp://10.10.0.10:2376
+DOCKER_CERT_DIR=/opt/control/certs
+CADDY_CONTAINER=caddy
+CADDY_CONF_DIR=/etc/caddy/sites
+BASE_DOMAIN=cowsaidmoo.tech
+APP_SERVER_IP=10.10.0.10
+DOCKER_NETWORK=wp_backend
+WP_DSN=control:control@123@tcp(10.10.0.20:3306)/
+```
+
+---
+
+## Source Files
+
+| File                    | Role                                                       |
+| ----------------------- | ---------------------------------------------------------- |
+| `main.go`               | wires everything, starts worker + HTTP server              |
+| `api.go`                | HTTP handlers (Gin)                                        |
+| `config.go`             | `LoadConfig()` from env                                    |
+| `db.go`                 | control-plane DB (jobs, sites)                             |
+| `naming.go`             | all resource name functions — only place names are defined |
+| `lifecycle.go`          | `SiteStatus` enum + state machine + domain validation      |
+| `provisioner.go`        | 7-step WP site provision + rollback                        |
+| `destroyer.go`          | reverse of provision                                       |
+| `static_provisioner.go` | static site provision                                      |
+| `worker.go`             | job poll loop                                              |
+| `caddy.go`              | `reloadCaddy()`, `ensureCaddyConfDir()`                    |
+| `tunnel.go`             | `TunnelManager` (custom domain routing)                    |
+
+---
+
+## Naming Conventions (from `naming.go`)
+
+```
+PHPContainerName(site)   → php_<site>
+NginxContainerName(site) → nginx_<site>
+VolumeName(site)         → wp_<site>
+WPDatabaseName(site)     → wp_<site>
+WPDatabaseUser(site)     → wp_<site>
+WPDatabasePass(site)     → pass_<site>
+CaddyConfFile(site)      → <site>.caddy
+NginxConfFile(site)      → <site>.conf
+SiteDomain(site, base)   → <site>.<base>
+```
+
+---
+
+## Site Status State Machine
+
+```
+CREATED → PROVISIONING → ACTIVE → DESTROYING → DESTROYED
+                       ↘ FAILED
+ACTIVE → DOMAIN_PENDING → DOMAIN_VALIDATING → DOMAIN_ROUTING → DOMAIN_ACTIVE
+```
+
+---
+
+## Deploy
+
+```bash
+cd /home/oni/hostplane
+go build -o control-plane .
+cp control-plane /opt/control/control-plane
+systemctl restart control-plane
+```
+
+---
+
+## Scripts (`/opt/control/scripts/`)
+
+- **`health.sh`** — checks service, MySQL, Docker, Caddy, per-site containers (php* + nginx*), smoke test
+- **`cleanup.sh`** — clears dead/zombie sites, stuck/pending jobs, orphaned containers/volumes/Caddy snippets
+- **`config.sh`** — sets up `/root/.my-hosto.cnf`
+
+---
+
+## Stale `.ai/` files (superseded, kept for git history only)
+
+- `plan.md` — old architectural principles doc
+- `lifecycle-refactor.md` — 943-line audit from before nginx-sidecar architecture
+- `caddy-manual-provsioning.md` — old manual guide, replaced by `detailed_runbook.md`
 
 ### P3 — Reconciliation loop
 
