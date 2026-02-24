@@ -27,7 +27,7 @@ func NewAPI(db *DB, cfg Config, docker *client.Client, tunnel *TunnelManager) *A
 
 // POST /api/sites/:site/domain
 //
-// Flow: Validate → Apply Infra → Confirm → Commit DB
+// Flow: Validate → DNS check → Apply Infra → Commit DB
 // DB is only written AFTER all infrastructure changes succeed.
 // On partial failure, completed infra steps are rolled back.
 func (a *API) handleSetCustomDomain(c *gin.Context) {
@@ -43,8 +43,14 @@ func (a *API) handleSetCustomDomain(c *gin.Context) {
 
 	domain := strings.ToLower(strings.TrimSpace(req.Domain))
 
-	// ── Validate ─────────────────────────────────────────────────────
+	// ── Validate format ───────────────────────────────────────────────
 	if err := ValidateCustomDomain(domain, a.cfg.BaseDomain); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// ── Validate DNS points to our ingress IP ───────────────────────
+	if err := ValidateDomainPointsToIngress(domain, a.cfg.PublicIP); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -75,34 +81,45 @@ func (a *API) handleSetCustomDomain(c *gin.Context) {
 		return
 	}
 
-	// ── Apply Infra FIRST ────────────────────────────────────────────
-	// Step 1: Regenerate Caddy config with new domain
+	isWP := a.isWordPressSite(existing)
+
+	// ── Apply Infra FIRST ─────────────────────────────────────────────
+	// Step 1 [WordPress only]: update nginx sidecar — add custom domain to
+	// server_name and switch HTTP_HOST to $host
+	if isWP {
+		p := NewProvisioner(a.docker, a.cfg)
+		if err := p.writeNginxConfigWithDomains(
+			NginxContainerName(site), PHPContainerName(site),
+			existing.Domain, domain,
+		); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "nginx config failed: " + err.Error()})
+			return
+		}
+	}
+
+	// Step 2: Regenerate Caddy snippet with both hostnames (gets TLS cert automatically)
 	if err := a.regenerateCaddy(site, existing.Domain, domain); err != nil {
+		// Rollback Step 1: revert nginx to single domain
+		if isWP {
+			p := NewProvisioner(a.docker, a.cfg)
+			p.writeNginxConfigWithDomains(NginxContainerName(site), PHPContainerName(site), existing.Domain, existing.CustomDomain)
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "caddy update failed: " + err.Error()})
 		return
 	}
 
-	// Step 2: Add tunnel DNS route
-	if err := a.tunnel.AddRoute(domain); err != nil {
-		// Rollback step 1: restore previous Caddy config
-		a.regenerateCaddy(site, existing.Domain, existing.CustomDomain)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "tunnel route failed: " + err.Error()})
-		return
+	// Step 3 [WordPress only]: update siteurl + home in wp_options.
+	// Best-effort — WordPress tables may not exist yet if WP hasn't been installed.
+	// nginx $host passthrough means requests still work even if this fails.
+	if isWP {
+		p := NewProvisioner(a.docker, a.cfg)
+		if err := p.updateWordPressURLs(site, "https://"+domain); err != nil {
+			log.Printf("[WARN] site=%s wp_options update failed (non-fatal): %v", site, err)
+		}
 	}
 
-	// Step 3: Update cloudflared config and restart (synchronous)
-	if err := a.tunnel.UpdateConfig(domain); err != nil {
-		// Rollback steps 1-2
-		a.tunnel.RemoveRoute(domain)
-		a.regenerateCaddy(site, existing.Domain, existing.CustomDomain)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "cloudflared config failed: " + err.Error()})
-		return
-	}
-
-	// ── Commit DB state LAST ─────────────────────────────────────────
+	// ── Commit DB state LAST ──────────────────────────────────────────
 	if err := a.db.SetCustomDomain(site, domain); err != nil {
-		// Infra is applied but DB commit failed — infra is correct state,
-		// next retry or reconcile will pick this up
 		log.Printf("[CRITICAL] site=%s domain=%s infra applied but DB commit failed: %v", site, domain, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "domain applied but failed to persist — retry the request"})
 		return
@@ -119,10 +136,9 @@ func (a *API) handleSetCustomDomain(c *gin.Context) {
 
 // DELETE /api/sites/:site/domain
 //
-// Flow: Validate → Remove Infra → Confirm → Commit DB
-// Infra is torn down BEFORE the DB record is updated.
-// If infra removal succeeds but DB fails, the domain is safely unrouted
-// and a retry will converge.
+// Flow: Remove Infra → Commit DB
+// Infra is reverted BEFORE the DB record is updated.
+// If infra reverts but DB fails, a retry will converge.
 func (a *API) handleRemoveCustomDomain(c *gin.Context) {
 	site := c.Param("site")
 
@@ -137,28 +153,41 @@ func (a *API) handleRemoveCustomDomain(c *gin.Context) {
 	}
 
 	customDomain := existing.CustomDomain
+	isWP := a.isWordPressSite(existing)
 
-	// ── Remove Infra FIRST ───────────────────────────────────────────
-	// Step 1: Regenerate Caddy config without the custom domain
+	// ── Remove Infra FIRST ────────────────────────────────────────────
+	// Step 1 [WordPress only]: revert nginx to single domain, hardcoded HTTP_HOST
+	if isWP {
+		p := NewProvisioner(a.docker, a.cfg)
+		if err := p.writeNginxConfigWithDomains(
+			NginxContainerName(site), PHPContainerName(site),
+			existing.Domain, "",
+		); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "nginx revert failed: " + err.Error()})
+			return
+		}
+	}
+
+	// Step 2: Regenerate Caddy snippet with only the default subdomain
 	if err := a.regenerateCaddy(site, existing.Domain, ""); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "caddy update failed: " + err.Error()})
+		// Rollback Step 1: put nginx back with custom domain
+		if isWP {
+			p := NewProvisioner(a.docker, a.cfg)
+			p.writeNginxConfigWithDomains(NginxContainerName(site), PHPContainerName(site), existing.Domain, customDomain)
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "caddy revert failed: " + err.Error()})
 		return
 	}
 
-	// Step 2: Remove from cloudflared config and restart (synchronous)
-	if err := a.tunnel.RemoveConfig(customDomain); err != nil {
-		// Rollback step 1: restore Caddy with the custom domain
-		a.regenerateCaddy(site, existing.Domain, customDomain)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "cloudflared config removal failed: " + err.Error()})
-		return
+	// Step 3 [WordPress only]: revert siteurl + home back to default subdomain
+	if isWP {
+		p := NewProvisioner(a.docker, a.cfg)
+		if err := p.updateWordPressURLs(site, "https://"+existing.Domain); err != nil {
+			log.Printf("[WARN] site=%s wp_options revert failed (non-fatal): %v", site, err)
+		}
 	}
 
-	// Step 3: Remove tunnel DNS route (best-effort, currently requires API)
-	if err := a.tunnel.RemoveRoute(customDomain); err != nil {
-		log.Printf("[WARN] site=%s tunnel route removal for %s failed: %v", site, customDomain, err)
-	}
-
-	// ── Commit DB state LAST ─────────────────────────────────────────
+	// ── Commit DB state LAST ──────────────────────────────────────────
 	if err := a.db.RemoveCustomDomain(site); err != nil {
 		log.Printf("[CRITICAL] site=%s domain=%s infra removed but DB commit failed: %v", site, customDomain, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "domain unrouted but failed to persist — retry the request"})
@@ -171,6 +200,19 @@ func (a *API) handleRemoveCustomDomain(c *gin.Context) {
 		"domain": existing.Domain,
 		"status": "custom domain removed",
 	})
+}
+
+// isWordPressSite returns true if the site was provisioned as a WordPress site
+// (as opposed to a static site). Used to gate nginx and wp_options updates.
+func (a *API) isWordPressSite(s *Site) bool {
+	if s.JobID == "" {
+		return true // assume WP when no job record available
+	}
+	job, err := a.db.GetJob(s.JobID)
+	if err != nil {
+		return true // safe default
+	}
+	return job.Type == JobProvision
 }
 
 func (a *API) regenerateCaddy(site, defaultDomain, customDomain string) error {

@@ -127,3 +127,20 @@ func ValidateDomainDNS(domain string) error {
 	}
 	return nil
 }
+
+// ValidateDomainPointsToIngress verifies the domain's A record resolves to the
+// expected public ingress IP (the VPS TCP forwarder). Custom domains must point
+// here before Caddy can obtain a TLS certificate for them.
+func ValidateDomainPointsToIngress(domain, expectedIP string) error {
+	addrs, err := net.LookupHost(domain)
+	if err != nil {
+		return fmt.Errorf("domain %s does not resolve: %w", domain, err)
+	}
+	for _, addr := range addrs {
+		if addr == expectedIP {
+			return nil
+		}
+	}
+	return fmt.Errorf("domain %s does not point to %s (resolved: %s) — set an A record to %s first",
+		domain, expectedIP, strings.Join(addrs, ", "), expectedIP)
+}

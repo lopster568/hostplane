@@ -317,10 +317,28 @@ func (p *Provisioner) createNginxContainer(nginxName, volumeName string) error {
 // sidecar container and reloads nginx. The config routes static file requests
 // directly from the WordPress volume and proxies PHP to the FPM container.
 func (p *Provisioner) writeNginxConfig(nginxName, phpName, domain string) error {
+	return p.writeNginxConfigWithDomains(nginxName, phpName, domain, "")
+}
+
+// writeNginxConfigWithDomains writes a multi-domain nginx server block.
+// When customDomain is non-empty, server_name includes both domains and
+// HTTP_HOST becomes $host so WordPress receives the correct hostname per request.
+// When customDomain is empty, the config is a single-domain block with a
+// hardcoded HTTP_HOST — used for initial provisioning and domain removal.
+func (p *Provisioner) writeNginxConfigWithDomains(nginxName, phpName, defaultDomain, customDomain string) error {
+	serverName := defaultDomain
+	httpHost := defaultDomain
+	if customDomain != "" {
+		serverName = defaultDomain + " " + customDomain
+		httpHost = "$host"
+	}
+
 	conf := fmt.Sprintf(`server {
     listen 80;
     root /var/www/html;
     index index.php;
+
+    server_name %s;
 
     location / {
         try_files $uri $uri/ /index.php?$args;
@@ -335,7 +353,7 @@ func (p *Provisioner) writeNginxConfig(nginxName, phpName, domain string) error 
         fastcgi_param HTTP_HOST %s;
     }
 }
-`, phpName, domain)
+`, serverName, phpName, httpHost)
 
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)
@@ -365,4 +383,33 @@ func (p *Provisioner) writeNginxConfig(nginxName, phpName, domain string) error 
 		return fmt.Errorf("nginx reload exec create: %w", err)
 	}
 	return p.docker.ContainerExecStart(ctx, execResp.ID, types.ExecStartCheck{})
+}
+
+// updateWordPressURLs sets siteurl and home in wp_options so WordPress serves
+// on the given URL. Call with "https://<customDomain>" when adding a custom
+// domain and "https://<defaultDomain>" when removing one.
+// Non-fatal if WordPress tables don't exist yet (site not installed).
+func (p *Provisioner) updateWordPressURLs(site, url string) error {
+	dsn := p.cfg.WordPressDSN + WPDatabaseName(site)
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return fmt.Errorf("open site DB: %w", err)
+	}
+	defer db.Close()
+
+	if err = db.Ping(); err != nil {
+		return fmt.Errorf("cannot reach site DB: %w", err)
+	}
+
+	for _, opt := range []string{"siteurl", "home"} {
+		if _, err := db.Exec(
+			"UPDATE wp_options SET option_value=? WHERE option_name=?",
+			url, opt,
+		); err != nil {
+			return fmt.Errorf("update %s: %w", opt, err)
+		}
+	}
+
+	log.Printf("[provisioner] site=%s wordpress URLs set to %s", site, url)
+	return nil
 }
