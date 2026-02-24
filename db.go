@@ -1,76 +1,77 @@
 package main
 
 import (
-    "database/sql"
-    "fmt"
-    "time"
-    _ "github.com/go-sql-driver/mysql"
+	"database/sql"
+	"fmt"
+	"time"
+
+	_ "github.com/go-sql-driver/mysql"
 )
 
-type JobType   string
+type JobType string
 type JobStatus string
 
 const (
-	JobProvision       JobType = "PROVISION"
-	JobDestroy         JobType = "DESTROY"
-	JobStaticProvision JobType = "STATIC_PROVISION"
-	 StatusPending    JobStatus = "PENDING"
-    StatusProcessing JobStatus = "PROCESSING"
-    StatusCompleted  JobStatus = "COMPLETED"
-    StatusFailed     JobStatus = "FAILED"
+	JobProvision       JobType   = "PROVISION"
+	JobDestroy         JobType   = "DESTROY"
+	JobStaticProvision JobType   = "STATIC_PROVISION"
+	StatusPending      JobStatus = "PENDING"
+	StatusProcessing   JobStatus = "PROCESSING"
+	StatusCompleted    JobStatus = "COMPLETED"
+	StatusFailed       JobStatus = "FAILED"
 )
 
 type Site struct {
-	Site      string
-	Domain    string
-	Status    string
-	JobID     string
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	Site         string
+	Domain       string
+	Status       string
+	JobID        string
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
 	CustomDomain string
 }
 
 func (d *DB) SetCustomDomain(site, domain string) error {
-    _, err := d.conn.Exec(`
+	_, err := d.conn.Exec(`
         UPDATE sites SET custom_domain=?, updated_at=NOW() WHERE site=?
     `, domain, site)
-    return err
+	return err
 }
 
 func (d *DB) RemoveCustomDomain(site string) error {
-    _, err := d.conn.Exec(`
+	_, err := d.conn.Exec(`
         UPDATE sites SET custom_domain=NULL, updated_at=NOW() WHERE site=?
     `, site)
-    return err
+	return err
 }
 
 func (d *DB) FailJob(jobID, site string, jobErr error) error {
-    msg := jobErr.Error()
-    _, err := d.conn.Exec(`
+	msg := jobErr.Error()
+	_, err := d.conn.Exec(`
         UPDATE jobs SET status='FAILED', error=?, updated_at=NOW() WHERE id=?
     `, msg, jobID)
-    if err != nil {
-        return err
-    }
-    // Mark site as FAILED so it's visible and cleanable
-    return d.UpdateSiteStatus(site, "FAILED")
+	if err != nil {
+		return err
+	}
+	// Mark site as FAILED so it's visible and cleanable
+	return d.UpdateSiteStatus(site, "FAILED")
 }
 
 func (d *DB) SetJobPayload(jobID, payload string) error {
-    _, err := d.conn.Exec(`UPDATE jobs SET payload=? WHERE id=?`, payload, jobID)
-    return err
+	_, err := d.conn.Exec(`UPDATE jobs SET payload=? WHERE id=?`, payload, jobID)
+	return err
 }
 
 func (d *DB) GetJobPayload(jobID string) (string, error) {
-    var val sql.NullString
-    err := d.conn.QueryRow(`SELECT payload FROM jobs WHERE id=?`, jobID).Scan(&val)
-    if err != nil {
-        return "", err
-    }
-    if val.Valid {
-        return val.String, nil
-    }
-    return "", nil
+	var val sql.NullString
+	err := d.conn.QueryRow(`SELECT payload FROM jobs WHERE id=?`, jobID).Scan(&val)
+	if err != nil {
+		return "", err
+	}
+	if val.Valid {
+		return val.String, nil
+	}
+	return "", nil
 }
 
 func (d *DB) HardDeleteSite(site string) error {
@@ -92,116 +93,116 @@ func (d *DB) HardDeleteJob(id string) error {
 }
 
 func (d *DB) GetSite(site string) (*Site, error) {
-    var s Site
-    err := d.conn.QueryRow(`
+	var s Site
+	err := d.conn.QueryRow(`
         SELECT site, domain, COALESCE(custom_domain,''), status, COALESCE(job_id,''), created_at, updated_at
         FROM sites WHERE site=?
     `, site).Scan(&s.Site, &s.Domain, &s.CustomDomain, &s.Status, &s.JobID, &s.CreatedAt, &s.UpdatedAt)
-    if err != nil {
-        return nil, err
-    }
-    return &s, nil
+	if err != nil {
+		return nil, err
+	}
+	return &s, nil
 }
 
 func (d *DB) ListSites() ([]Site, error) {
-    rows, err := d.conn.Query(`
+	rows, err := d.conn.Query(`
         SELECT site, domain, COALESCE(custom_domain,''), status, COALESCE(job_id,''), created_at, updated_at
         FROM sites ORDER BY created_at DESC
     `)
-    if err != nil {
-        return nil, err
-    }
-    defer rows.Close()
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
 
-    var sites []Site
-    for rows.Next() {
-        var s Site
-        if err := rows.Scan(&s.Site, &s.Domain, &s.CustomDomain, &s.Status, &s.JobID, &s.CreatedAt, &s.UpdatedAt); err != nil {
-            return nil, err
-        }
-        sites = append(sites, s)
-    }
-    return sites, nil
+	var sites []Site
+	for rows.Next() {
+		var s Site
+		if err := rows.Scan(&s.Site, &s.Domain, &s.CustomDomain, &s.Status, &s.JobID, &s.CreatedAt, &s.UpdatedAt); err != nil {
+			return nil, err
+		}
+		sites = append(sites, s)
+	}
+	return sites, nil
 }
 
 type Job struct {
-    ID          string
-    Type        JobType
-    Site        string
-    Status      JobStatus
-    Attempts    int
-    MaxAttempts int
-    Error       *string
-    CreatedAt   time.Time
-    UpdatedAt   time.Time
-    StartedAt   *time.Time
-    CompletedAt *time.Time
+	ID          string
+	Type        JobType
+	Site        string
+	Status      JobStatus
+	Attempts    int
+	MaxAttempts int
+	Error       *string
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+	StartedAt   *time.Time
+	CompletedAt *time.Time
 }
 
 type DB struct {
-    conn *sql.DB
+	conn *sql.DB
 }
 
 func NewDB(dsn string) (*DB, error) {
-    conn, err := sql.Open("mysql", dsn)
-    if err != nil {
-        return nil, err
-    }
-    conn.SetMaxOpenConns(10)
-    conn.SetMaxIdleConns(5)
-    conn.SetConnMaxLifetime(5 * time.Minute)
-    if err = conn.Ping(); err != nil {
-        return nil, fmt.Errorf("cannot reach control DB: %w", err)
-    }
-    return &DB{conn: conn}, nil
+	conn, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return nil, err
+	}
+	conn.SetMaxOpenConns(10)
+	conn.SetMaxIdleConns(5)
+	conn.SetConnMaxLifetime(5 * time.Minute)
+	if err = conn.Ping(); err != nil {
+		return nil, fmt.Errorf("cannot reach control DB: %w", err)
+	}
+	return &DB{conn: conn}, nil
 }
 
 // InsertJob writes a new PENDING job and returns its ID
 func (d *DB) InsertJob(id string, jobType JobType, site string) error {
-    _, err := d.conn.Exec(`
+	_, err := d.conn.Exec(`
         INSERT INTO jobs (id, type, site, status, attempts, max_attempts)
         VALUES (?, ?, ?, 'PENDING', 0, 3)
     `, id, jobType, site)
-    return err
+	return err
 }
 
 // InsertSite creates or updates the site record
 func (d *DB) UpsertSite(site, domain, status, jobID string) error {
-    _, err := d.conn.Exec(`
+	_, err := d.conn.Exec(`
         INSERT INTO sites (site, domain, status, job_id)
         VALUES (?, ?, ?, ?)
         ON DUPLICATE KEY UPDATE status=VALUES(status), job_id=VALUES(job_id), updated_at=NOW()
     `, site, domain, status, jobID)
-    return err
+	return err
 }
 
 // UpdateSiteStatus updates just the status of a site
 func (d *DB) UpdateSiteStatus(site, status string) error {
-    _, err := d.conn.Exec(`
+	_, err := d.conn.Exec(`
         UPDATE sites SET status=?, updated_at=NOW() WHERE site=?
     `, status, site)
-    return err
+	return err
 }
 
 // HasActiveJob checks if site already has a PENDING or PROCESSING job
 func (d *DB) HasActiveJob(site string) (bool, error) {
-    var count int
-    err := d.conn.QueryRow(`
+	var count int
+	err := d.conn.QueryRow(`
         SELECT COUNT(*) FROM jobs
         WHERE site=? AND status IN ('PENDING','PROCESSING')
     `, site).Scan(&count)
-    return count > 0, err
+	return count > 0, err
 }
 
 // ClaimNextJob atomically claims the next PENDING job using FOR UPDATE SKIP LOCKED
 func (d *DB) ClaimNextJob() (*Job, error) {
-    tx, err := d.conn.Begin()
-    if err != nil {
-        return nil, err
-    }
-    defer tx.Rollback()
+	tx, err := d.conn.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
 
-    row := tx.QueryRow(`
+	row := tx.QueryRow(`
         SELECT id, type, site, attempts, max_attempts
         FROM jobs
         WHERE status='PENDING' AND attempts < max_attempts
@@ -210,82 +211,88 @@ func (d *DB) ClaimNextJob() (*Job, error) {
         FOR UPDATE SKIP LOCKED
     `)
 
-    var job Job
-    err = row.Scan(&job.ID, &job.Type, &job.Site, &job.Attempts, &job.MaxAttempts)
-    if err == sql.ErrNoRows {
-        return nil, nil // nothing to do
-    }
-    if err != nil {
-        return nil, err
-    }
+	var job Job
+	err = row.Scan(&job.ID, &job.Type, &job.Site, &job.Attempts, &job.MaxAttempts)
+	if err == sql.ErrNoRows {
+		return nil, nil // nothing to do
+	}
+	if err != nil {
+		return nil, err
+	}
 
-    _, err = tx.Exec(`
+	_, err = tx.Exec(`
         UPDATE jobs
         SET status='PROCESSING', attempts=attempts+1, started_at=NOW(), updated_at=NOW()
         WHERE id=?
     `, job.ID)
-    if err != nil {
-        return nil, err
-    }
+	if err != nil {
+		return nil, err
+	}
 
-    return &job, tx.Commit()
+	return &job, tx.Commit()
 }
 
 // CompleteJob marks job and site as done
 func (d *DB) CompleteJob(jobID, site string, jobType JobType) error {
-    _, err := d.conn.Exec(`
+	_, err := d.conn.Exec(`
         UPDATE jobs
         SET status='COMPLETED', completed_at=NOW(), updated_at=NOW(), error=NULL
         WHERE id=?
     `, jobID)
-    if err != nil {
-        return err
-    }
+	if err != nil {
+		return err
+	}
 
-    finalSiteStatus := "ACTIVE"
-    if jobType == JobDestroy {
-        finalSiteStatus = "DESTROYED"
-    }
-    return d.UpdateSiteStatus(site, finalSiteStatus)
+	finalSiteStatus := "ACTIVE"
+	if jobType == JobDestroy {
+		finalSiteStatus = "DESTROYED"
+	}
+	return d.UpdateSiteStatus(site, finalSiteStatus)
 }
 
 // GetJob fetches a job by ID for status polling
 func (d *DB) GetJob(id string) (*Job, error) {
-    var job Job
-    var errStr sql.NullString
-    var startedAt, completedAt sql.NullTime
+	var job Job
+	var errStr sql.NullString
+	var startedAt, completedAt sql.NullTime
 
-    err := d.conn.QueryRow(`
+	err := d.conn.QueryRow(`
         SELECT id, type, site, status, attempts, max_attempts, error, created_at, updated_at, started_at, completed_at
         FROM jobs WHERE id=?
     `, id).Scan(
-        &job.ID, &job.Type, &job.Site, &job.Status,
-        &job.Attempts, &job.MaxAttempts, &errStr,
-        &job.CreatedAt, &job.UpdatedAt, &startedAt, &completedAt,
-    )
-    if err != nil {
-        return nil, err
-    }
+		&job.ID, &job.Type, &job.Site, &job.Status,
+		&job.Attempts, &job.MaxAttempts, &errStr,
+		&job.CreatedAt, &job.UpdatedAt, &startedAt, &completedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
 
-    if errStr.Valid   { job.Error       = &errStr.String  }
-    if startedAt.Valid { job.StartedAt  = &startedAt.Time  }
-    if completedAt.Valid { job.CompletedAt = &completedAt.Time }
+	if errStr.Valid {
+		job.Error = &errStr.String
+	}
+	if startedAt.Valid {
+		job.StartedAt = &startedAt.Time
+	}
+	if completedAt.Valid {
+		job.CompletedAt = &completedAt.Time
+	}
 
-    return &job, nil
+	return &job, nil
 }
 
 // RecoverStuckJobs resets PROCESSING jobs that have been running too long (called on startup)
 func (d *DB) RecoverStuckJobs(timeoutMinutes int) (int64, error) {
-    res, err := d.conn.Exec(`
+	res, err := d.conn.Exec(`
         UPDATE jobs
         SET status='PENDING', error='recovered: was stuck in PROCESSING', updated_at=NOW()
         WHERE status='PROCESSING'
         AND started_at < NOW() - INTERVAL ? MINUTE
     `, timeoutMinutes)
-    if err != nil {
-        return 0, err
-    }
-    return res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 // RetryJob puts a PROCESSING job back to PENDING for the next poll cycle to pick up
@@ -297,4 +304,57 @@ func (d *DB) RetryJob(jobID string, jobErr error) error {
 		WHERE id=?
 	`, msg, jobID)
 	return err
+}
+
+// TransitionSite validates and performs a state transition using the lifecycle state machine.
+// Returns an error if the transition is not allowed.
+func (d *DB) TransitionSite(site string, to SiteStatus) error {
+	s, err := d.GetSite(site)
+	if err != nil {
+		return fmt.Errorf("get site %s: %w", site, err)
+	}
+	from := SiteStatus(s.Status)
+	if !from.CanTransitionTo(to) {
+		return fmt.Errorf("invalid transition: %s → %s for site %s", from, to, site)
+	}
+	return d.UpdateSiteStatus(site, string(to))
+}
+
+// EnsureDomainAvailable checks that no other active site has claimed this custom domain.
+func (d *DB) EnsureDomainAvailable(domain, excludeSite string) error {
+	var count int
+	err := d.conn.QueryRow(`
+		SELECT COUNT(*) FROM sites
+		WHERE custom_domain=? AND site!=? AND status NOT IN ('DESTROYED','FAILED')
+	`, domain, excludeSite).Scan(&count)
+	if err != nil {
+		return fmt.Errorf("check domain availability: %w", err)
+	}
+	if count > 0 {
+		return fmt.Errorf("domain %s is already claimed by another site", domain)
+	}
+	return nil
+}
+
+// ListCustomDomains returns all active custom domain values from the sites table.
+func (d *DB) ListCustomDomains() ([]string, error) {
+	rows, err := d.conn.Query(`
+		SELECT custom_domain FROM sites
+		WHERE custom_domain IS NOT NULL AND custom_domain != ''
+		AND status NOT IN ('DESTROYED','FAILED')
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var domains []string
+	for rows.Next() {
+		var dom string
+		if err := rows.Scan(&dom); err != nil {
+			return nil, err
+		}
+		domains = append(domains, dom)
+	}
+	return domains, nil
 }
