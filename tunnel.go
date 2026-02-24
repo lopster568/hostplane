@@ -11,6 +11,11 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// NOTE: AddRoute and RemoveRoute still use os/exec for `cloudflared tunnel route dns`.
+// UpdateConfig and RemoveConfig no longer restart cloudflared — the catch-all
+// ingress rule routes all tunnel traffic to ServiceTarget, so DNS routes alone
+// control which domains are served. This eliminates the ~30s downtime window.
+
 // TunnelManager manages Cloudflare tunnel configuration and DNS routes.
 // All methods use configurable paths from Config — no hard-coded constants.
 type TunnelManager struct {
@@ -89,7 +94,9 @@ func (tm *TunnelManager) RemoveRoute(domain string) error {
 	return nil
 }
 
-// UpdateConfig adds a domain to the cloudflared ingress and restarts synchronously.
+// UpdateConfig adds a domain to the cloudflared ingress rules for auditability.
+// Does NOT restart cloudflared — the catch-all rule already routes all tunnel
+// traffic to the service target, so DNS routes alone are sufficient for routing.
 // Idempotent — skips if the domain is already present.
 func (tm *TunnelManager) UpdateConfig(domain string) error {
 	cfg, err := tm.loadConfig()
@@ -110,23 +117,27 @@ func (tm *TunnelManager) UpdateConfig(domain string) error {
 		Service:  tm.cfg.ServiceTarget,
 	}
 
+	// Ensure catch-all routes to service target (not 404)
+	tm.ensureCatchAll(cfg)
+
 	// Insert before catch-all (last entry)
 	if len(cfg.Ingress) > 0 {
 		catchAll := cfg.Ingress[len(cfg.Ingress)-1]
 		cfg.Ingress = append(cfg.Ingress[:len(cfg.Ingress)-1], newRule, catchAll)
 	} else {
-		cfg.Ingress = append(cfg.Ingress, newRule, IngressRule{Service: "http_status:404"})
+		cfg.Ingress = append(cfg.Ingress, newRule, IngressRule{Service: tm.cfg.ServiceTarget})
 	}
 
 	if err := tm.saveConfig(cfg); err != nil {
 		return err
 	}
 
-	log.Printf("[tunnel] added %s to config, restarting cloudflared", domain)
-	return restartCloudflared()
+	log.Printf("[tunnel] added %s to ingress config (no restart needed)", domain)
+	return nil
 }
 
-// RemoveConfig removes a domain from the cloudflared ingress and restarts synchronously.
+// RemoveConfig removes a domain from the cloudflared ingress rules.
+// Does NOT restart cloudflared — removal is recorded for auditability only.
 // Idempotent — no-op if the domain is not present.
 func (tm *TunnelManager) RemoveConfig(domain string) error {
 	cfg, err := tm.loadConfig()
@@ -155,16 +166,20 @@ func (tm *TunnelManager) RemoveConfig(domain string) error {
 		return err
 	}
 
-	log.Printf("[tunnel] removed %s from config, restarting cloudflared", domain)
-	return restartCloudflared()
+	log.Printf("[tunnel] removed %s from ingress config (no restart needed)", domain)
+	return nil
 }
 
-func restartCloudflared() error {
-	cmd := exec.Command("systemctl", "restart", "cloudflared")
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("restart cloudflared: %s", string(out))
+// ensureCatchAll makes sure the catch-all (last) ingress rule routes to the
+// service target instead of returning 404. This is what allows DNS-route-only
+// domain additions without restarting cloudflared.
+func (tm *TunnelManager) ensureCatchAll(cfg *CloudflaredConfig) {
+	if len(cfg.Ingress) == 0 {
+		return
 	}
-	log.Println("[tunnel] cloudflared restarted successfully")
-	return nil
+	last := &cfg.Ingress[len(cfg.Ingress)-1]
+	if last.Hostname == "" && last.Service != tm.cfg.ServiceTarget {
+		log.Printf("[tunnel] updating catch-all from %s to %s", last.Service, tm.cfg.ServiceTarget)
+		last.Service = tm.cfg.ServiceTarget
+	}
 }
