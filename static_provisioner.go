@@ -99,14 +99,14 @@ func (p *StaticProvisioner) uploadZipToStaticSites(site, zipPath string) error {
 	}
 	defer p.docker.ContainerRemove(ctx, resp.ID, types.ContainerRemoveOptions{Force: true})
 
-	tarBuf, err := zipToTar(zipPath)
+	tarBuf, err := zipToTar(zipPath, site)
 	if err != nil {
 		return fmt.Errorf("zip to tar: %w", err)
 	}
 
-	// Copy files into /data/{site}/ — this becomes /srv/sites/{site} inside Caddy
-	destPath := "/data/" + site
-	if err = p.docker.CopyToContainer(ctx, resp.ID, destPath, tarBuf, types.CopyToContainerOptions{}); err != nil {
+	// Copy to /data/ with files prefixed as {site}/<file> so Docker creates
+	// the subdirectory automatically — /data/{site}/ becomes /srv/sites/{site}/ in Caddy
+	if err = p.docker.CopyToContainer(ctx, resp.ID, "/data/", tarBuf, types.CopyToContainerOptions{}); err != nil {
 		return fmt.Errorf("copy to container: %w", err)
 	}
 
@@ -157,7 +157,7 @@ func (p *StaticProvisioner) removeStaticSiteFiles(site string) {
 	log.Printf("[rollback] removed static site files for %s", site)
 }
 
-func zipToTar(zipPath string) (io.Reader, error) {
+func zipToTar(zipPath, sitePrefix string) (io.Reader, error) {
 	zr, err := zip.OpenReader(zipPath)
 	if err != nil {
 		return nil, err
@@ -183,11 +183,13 @@ func zipToTar(zipPath string) (io.Reader, error) {
 			return nil, err
 		}
 
-		// Strip top-level directory from zip if present
+		// Strip top-level directory from zip if present, then prefix with site name.
+		// This makes files land at /data/{site}/<file> when copied to /data/.
 		name := filepath.Base(f.Name)
 		if filepath.Dir(f.Name) != "." {
 			name = f.Name
 		}
+		name = sitePrefix + "/" + name
 
 		tw.WriteHeader(&tar.Header{
 			Name: name,
