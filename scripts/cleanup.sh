@@ -52,7 +52,91 @@ else
   fi
 fi
 
-# ── 2. Orphaned containers ─────────────────────────────────────
+# ── 2. Jobs stuck in PENDING too long ────────────────────────
+# These are jobs the worker has never claimed. Typically left over when the
+# control-plane was restarted mid-queue, or jobs that were manually re-inserted.
+# Threshold: 30 minutes. The worker polls every 3s, so 30 min = definitely stuck.
+echo ""
+echo "[ STUCK PENDING JOBS ]"
+
+STUCK_PENDING=$($MYSQL "SELECT j.id, j.site, j.type, j.attempts, j.max_attempts,
+    TIMESTAMPDIFF(MINUTE, j.created_at, NOW()) AS age_min
+  FROM jobs j
+  WHERE j.status='PENDING'
+    AND j.created_at < NOW() - INTERVAL 30 MINUTE
+  ORDER BY j.created_at;" 2>/dev/null)
+
+if [ -z "$STUCK_PENDING" ]; then
+  echo -e "${GREEN}✓${NC} No jobs stuck in PENDING >30 min"
+else
+  echo -e "${YELLOW}!${NC} Jobs stuck in PENDING >30 min:"
+  echo "  ID | SITE | TYPE | ATTEMPTS | AGE(min)"
+  while IFS=$'\t' read -r jid site jtype attempts maxatt age; do
+    echo "  $jid | $site | $jtype | $attempts/$maxatt | ${age}m"
+  done <<< "$STUCK_PENDING"
+  echo ""
+  echo "Options:"
+  echo "  r) Reset them to PENDING with attempt count zeroed (worker will re-try)"
+  echo "  d) Delete them (remove from queue permanently)"
+  echo "  s) Skip"
+  read -p "Choice [r/d/s]: " choice
+  case "$choice" in
+    r)
+      while IFS=$'\t' read -r jid _rest; do
+        mysql --defaults-file=/root/.my-hosto.cnf controlplane -e "
+          UPDATE jobs SET status='PENDING', attempts=0, started_at=NULL,
+            updated_at=NOW() WHERE id='$jid';"
+        echo -e "${GREEN}✓${NC} Reset job $jid"
+      done <<< "$STUCK_PENDING"
+      ;;
+    d)
+      while IFS=$'\t' read -r jid _rest; do
+        mysql --defaults-file=/root/.my-hosto.cnf controlplane -e \
+          "DELETE FROM jobs WHERE id='$jid';"
+        echo -e "${GREEN}✓${NC} Deleted job $jid"
+      done <<< "$STUCK_PENDING"
+      ;;
+    *)
+      echo "Skipped."
+      ;;
+  esac
+fi
+
+# Also catch sites whose status is still PROVISIONING but the worker has given
+# up on the job (all retries exhausted → job=FAILED, site still=PROVISIONING).
+# These are zombie sites: no containers, no DB entry, but occupy a site name.
+echo ""
+echo "[ PROVISIONING ZOMBIES ]"
+
+ZOMBIES=$($MYSQL "SELECT s.site, j.attempts, j.max_attempts,
+    TIMESTAMPDIFF(MINUTE, j.updated_at, NOW()) AS idle_min
+  FROM sites s
+  JOIN jobs j ON s.job_id = j.id
+  WHERE s.status = 'PROVISIONING'
+    AND j.status  = 'FAILED';" 2>/dev/null)
+
+if [ -z "$ZOMBIES" ]; then
+  echo -e "${GREEN}✓${NC} No zombie PROVISIONING sites"
+else
+  echo -e "${YELLOW}!${NC} Sites stuck in PROVISIONING with all job retries exhausted:"
+  while IFS=$'\t' read -r site attempts maxatt idle; do
+    echo "  - $site (attempts: $attempts/$maxatt, idle: ${idle}m)"
+  done <<< "$ZOMBIES"
+  echo ""
+  read -p "Mark them FAILED and remove from queue? [y/N] " confirm
+  if [ "$confirm" = "y" ]; then
+    while IFS=$'\t' read -r site _rest; do
+      mysql --defaults-file=/root/.my-hosto.cnf controlplane -e "
+        UPDATE sites SET status='FAILED', updated_at=NOW() WHERE site='$site';
+        DELETE FROM jobs WHERE site='$site' AND status='FAILED';"
+      echo -e "${GREEN}✓${NC} Marked $site as FAILED, cleared job"
+    done <<< "$ZOMBIES"
+  else
+    echo "Skipped."
+  fi
+fi
+
+# ── 3. Orphaned containers ─────────────────────────────────────
 echo ""
 echo "[ ORPHANED CONTAINERS ]"
 
@@ -85,7 +169,7 @@ else
   fi
 fi
 
-# ── 3. Orphaned Docker volumes ────────────────────────────────
+# ── 4. Orphaned Docker volumes ────────────────────────────────
 echo ""
 echo "[ ORPHANED VOLUMES ]"
 
@@ -115,7 +199,7 @@ else
   fi
 fi
 
-# ── 4. Orphaned Caddy snippets ─────────────────────────────────
+# ── 5. Orphaned Caddy snippets ─────────────────────────────────
 echo ""
 echo "[ ORPHANED CADDY CONFIGS ]"
 
@@ -147,7 +231,7 @@ else
   fi
 fi
 
-# ── 5. Old failed jobs ─────────────────────────────────────────
+# ── 6. Old failed jobs ─────────────────────────────────────────
 echo ""
 echo "[ OLD FAILED JOBS ]"
 
@@ -167,7 +251,7 @@ else
   fi
 fi
 
-# ── 6. Orphaned tmp files ──────────────────────────────────────
+# ── 7. Orphaned tmp files ──────────────────────────────────────
 echo ""
 echo "[ ORPHANED TMP FILES ]"
 
