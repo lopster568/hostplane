@@ -35,7 +35,10 @@ else
   for site in $ALL_DEAD; do
     STATUS=$($MYSQL "SELECT status FROM sites WHERE site='$site';")
     JOB_STATUS=$($MYSQL "SELECT COALESCE(j.status,'?') FROM sites s LEFT JOIN jobs j ON s.job_id=j.id WHERE s.site='$site';")
-    echo "  - $site (site: $STATUS, job: $JOB_STATUS)"
+    CUSTOM_DOMAIN=$($MYSQL "SELECT COALESCE(custom_domain,'') FROM sites WHERE site='$site';")
+    DOMAIN_LABEL=""
+    [ -n "$CUSTOM_DOMAIN" ] && DOMAIN_LABEL=" | custom_domain: $CUSTOM_DOMAIN"
+    echo "  - $site (site: $STATUS, job: $JOB_STATUS$DOMAIN_LABEL)"
   done
   echo ""
   read -p "Delete all dead/stranded sites and their jobs from DB? [y/N] " confirm
@@ -147,7 +150,7 @@ echo "[ ORPHANED CONTAINERS ]"
 
 # Collect all php_* and nginx_* containers running on app-01
 ALL_CONTAINERS=$($DOCKER ps --format '{{.Names}}' | grep -E '^(php_|nginx_)')
-ACTIVE_SITES=$($MYSQL "SELECT site FROM sites WHERE status='ACTIVE';")
+ACTIVE_SITES=$($MYSQL "SELECT site FROM sites WHERE status IN ('ACTIVE','DOMAIN_ACTIVE');")
 
 ORPHANED=""
 for cname in $ALL_CONTAINERS; do
@@ -179,7 +182,7 @@ echo ""
 echo "[ ORPHANED VOLUMES ]"
 
 ALL_VOLUMES=$($DOCKER volume ls --format '{{.Name}}' | grep '^wp_')
-ACTIVE_SITES=$($MYSQL "SELECT site FROM sites WHERE status='ACTIVE';")
+ACTIVE_SITES=$($MYSQL "SELECT site FROM sites WHERE status IN ('ACTIVE','DOMAIN_ACTIVE');")
 
 ORPHANED_VOLS=""
 for vol in $ALL_VOLUMES; do
@@ -210,7 +213,7 @@ echo "[ ORPHANED CADDY CONFIGS ]"
 
 ALL_SNIPPETS=$($DOCKER exec caddy sh -c 'ls /etc/caddy/sites/*.caddy 2>/dev/null' \
   | xargs -n1 basename 2>/dev/null | sed 's/\.caddy$//')
-ACTIVE_SITES=$($MYSQL "SELECT site FROM sites WHERE status='ACTIVE';")
+ACTIVE_SITES=$($MYSQL "SELECT site FROM sites WHERE status IN ('ACTIVE','DOMAIN_ACTIVE');")
 
 ORPHANED_CADDY=""
 for site in $ALL_SNIPPETS; do
@@ -236,7 +239,85 @@ else
   fi
 fi
 
-# ── 6. Old failed jobs ─────────────────────────────────────────
+# ── 6. Stale custom domain DB records ─────────────────────────
+# Sites that are DESTROYED or FAILED with custom_domain still set in the
+# controlplane DB. The Caddy snippet is already gone (handled above) but
+# the custom_domain column should be cleared so the name can be reused.
+echo ""
+echo "[ STALE CUSTOM DOMAINS ]"
+
+STALE_DOMAINS=$($MYSQL "SELECT site, custom_domain FROM sites \
+  WHERE custom_domain IS NOT NULL AND custom_domain != '' \
+  AND status IN ('DESTROYED','FAILED') \
+  ORDER BY site;" 2>/dev/null)
+
+if [ -z "$STALE_DOMAINS" ]; then
+  echo -e "${GREEN}✓${NC} No stale custom domain records"
+else
+  echo -e "${YELLOW}!${NC} Sites with custom_domain still set but status DESTROYED/FAILED:"
+  while IFS=$'\t' read -r site domain; do
+    STATUS=$($MYSQL "SELECT status FROM sites WHERE site='$site';")
+    echo "  - $site → $domain (status: $STATUS)"
+  done <<< "$STALE_DOMAINS"
+  echo ""
+  read -p "Clear custom_domain field for these sites? [y/N] " confirm
+  if [ "$confirm" = "y" ]; then
+    while IFS=$'\t' read -r site domain; do
+      mysql --defaults-file=/root/.my-hosto.cnf controlplane -e \
+        "UPDATE sites SET custom_domain=NULL, updated_at=NOW() WHERE site='$site';"
+      echo -e "${GREEN}✓${NC} Cleared custom_domain for $site (was: $domain)"
+    done <<< "$STALE_DOMAINS"
+  else
+    echo "Skipped."
+  fi
+fi
+
+# Also detect ACTIVE/DOMAIN_ACTIVE sites whose custom_domain is set in DB but
+# the containers are gone — these are externally destroyed without going through
+# the API. Clear the custom_domain and mark them FAILED so cleanup section 1
+# can pick them up on next run.
+echo ""
+echo "[ CUSTOM DOMAIN — CONTAINER MISMATCH ]"
+
+DOMAIN_ACTIVE_SITES=$($MYSQL "SELECT site, custom_domain FROM sites \
+  WHERE custom_domain IS NOT NULL AND custom_domain != '' \
+  AND status IN ('ACTIVE','DOMAIN_ACTIVE');" 2>/dev/null)
+
+MISMATCH_FOUND=0
+while IFS=$'\t' read -r site domain; do
+  [ -z "$site" ] && continue
+  PHP_STATUS=$($DOCKER inspect "php_${site}" --format '{{.State.Status}}' 2>/dev/null)
+  if [ -z "$PHP_STATUS" ]; then
+    echo -e "${YELLOW}!${NC} $site has custom_domain=$domain but php_${site} is gone"
+    MISMATCH_FOUND=1
+  fi
+done <<< "$DOMAIN_ACTIVE_SITES"
+
+if [ "$MISMATCH_FOUND" = "0" ]; then
+  echo -e "${GREEN}✓${NC} All sites with custom domains have running containers"
+else
+  echo ""
+  read -p "Remove Caddy snippet + clear custom_domain for missing-container sites? [y/N] " confirm
+  if [ "$confirm" = "y" ]; then
+    while IFS=$'\t' read -r site domain; do
+      [ -z "$site" ] && continue
+      PHP_STATUS=$($DOCKER inspect "php_${site}" --format '{{.State.Status}}' 2>/dev/null)
+      if [ -z "$PHP_STATUS" ]; then
+        # Remove Caddy snippet for this site
+        $DOCKER exec caddy rm -f "/etc/caddy/sites/${site}.caddy" 2>/dev/null
+        $DOCKER exec caddy caddy reload --config /etc/caddy/Caddyfile 2>/dev/null
+        # Clear custom_domain and mark FAILED in DB
+        mysql --defaults-file=/root/.my-hosto.cnf controlplane -e \
+          "UPDATE sites SET custom_domain=NULL, status='FAILED', updated_at=NOW() WHERE site='$site';"
+        echo -e "${GREEN}✓${NC} Cleaned up $site — Caddy snippet removed, custom_domain cleared, marked FAILED"
+      fi
+    done <<< "$DOMAIN_ACTIVE_SITES"
+  else
+    echo "Skipped."
+  fi
+fi
+
+# ── 7. Old failed jobs ─────────────────────────────────────────
 echo ""
 echo "[ OLD FAILED JOBS ]"
 
@@ -256,7 +337,7 @@ else
   fi
 fi
 
-# ── 7. Orphaned tmp files ──────────────────────────────────────
+# ── 8. Orphaned tmp files ──────────────────────────────────────
 echo ""
 echo "[ ORPHANED TMP FILES ]"
 

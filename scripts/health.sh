@@ -112,7 +112,7 @@ fi
 echo ""
 echo "[ CONTAINERS ON APP-01 ]"
 
-KNOWN_SITES=$($MYSQL "SELECT site FROM sites WHERE status IN ('ACTIVE','PROVISIONING');" 2>/dev/null)
+KNOWN_SITES=$($MYSQL "SELECT site FROM sites WHERE status IN ('ACTIVE','DOMAIN_ACTIVE','PROVISIONING');" 2>/dev/null)
 
 for site in $KNOWN_SITES; do
   [ -z "$site" ] && continue
@@ -120,7 +120,7 @@ for site in $KNOWN_SITES; do
   PHP_STATUS=$($DOCKER inspect "php_${site}" --format '{{.State.Status}}' 2>/dev/null)
   NGINX_STATUS=$($DOCKER inspect "nginx_${site}" --format '{{.State.Status}}' 2>/dev/null)
 
-  if [ "$DB_STATUS" = "ACTIVE" ]; then
+  if [ "$DB_STATUS" = "ACTIVE" ] || [ "$DB_STATUS" = "DOMAIN_ACTIVE" ]; then
     # ACTIVE: both containers MUST be running
     if [ "$PHP_STATUS" = "running" ]; then
       pass "php_${site} running  (db: ACTIVE)"
@@ -160,7 +160,7 @@ done <<< "$ALL_RUNNING"
 echo ""
 echo "[ ACTIVE SITES ]"
 
-ACTIVE_SITES=$($MYSQL "SELECT site FROM sites WHERE status='ACTIVE';")
+ACTIVE_SITES=$($MYSQL "SELECT site FROM sites WHERE status IN ('ACTIVE','DOMAIN_ACTIVE');")
 
 if [ -z "$ACTIVE_SITES" ]; then
   echo "  No active sites."
@@ -200,6 +200,29 @@ else
       fail "  /etc/caddy/sites/${site}.caddy MISSING — site will not be proxied"
     fi
 
+    # Custom domain checks
+    CUSTOM_DOMAIN=$($MYSQL "SELECT COALESCE(custom_domain,'') FROM sites WHERE site='$site';")
+    if [ -n "$CUSTOM_DOMAIN" ]; then
+      # Caddy snippet must contain the custom domain
+      CADDY_CONTENT=$($DOCKER exec caddy cat "/etc/caddy/sites/${site}.caddy" 2>/dev/null)
+      if echo "$CADDY_CONTENT" | grep -q "$CUSTOM_DOMAIN"; then
+        pass "  Caddy snippet includes custom domain $CUSTOM_DOMAIN"
+      else
+        fail "  Caddy snippet MISSING custom domain $CUSTOM_DOMAIN (DB says it's set)"
+      fi
+
+      # nginx server_name must include the custom domain (WP sites only)
+      PHP_STATUS=$($DOCKER inspect "php_${site}" --format '{{.State.Status}}' 2>/dev/null)
+      if [ "$PHP_STATUS" = "running" ]; then
+        NGINX_CONF=$($DOCKER exec "nginx_${site}" cat /etc/nginx/conf.d/default.conf 2>/dev/null)
+        if echo "$NGINX_CONF" | grep -q "$CUSTOM_DOMAIN"; then
+          pass "  nginx server_name includes $CUSTOM_DOMAIN"
+        else
+          fail "  nginx server_name MISSING $CUSTOM_DOMAIN — HTTP_HOST will be wrong"
+        fi
+      fi
+    fi
+
     # HTTP smoke test through the actual stack
     DOMAIN="$($MYSQL "SELECT COALESCE(custom_domain, CONCAT(site, '.cowsaidmoo.tech')) FROM sites WHERE site='$site';")"
     HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "https://${DOMAIN}" 2>/dev/null)
@@ -218,9 +241,13 @@ fi
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 TOTAL_SITES=$($MYSQL "SELECT COUNT(*) FROM sites WHERE status='ACTIVE';")
-echo "  Active sites : $TOTAL_SITES"
-echo "  Failed jobs  : $FAILED_JOBS"
-echo "  Pending jobs : $PENDING"
+DOMAIN_ACTIVE=$($MYSQL "SELECT COUNT(*) FROM sites WHERE status='DOMAIN_ACTIVE';")
+CUSTOM_DOMAINS=$($MYSQL "SELECT COUNT(*) FROM sites WHERE custom_domain IS NOT NULL AND custom_domain != '' AND status IN ('ACTIVE','DOMAIN_ACTIVE');")
+echo "  Active sites   : $TOTAL_SITES"
+echo "  Domain active  : $DOMAIN_ACTIVE"
+echo "  Custom domains : $CUSTOM_DOMAINS"
+echo "  Failed jobs    : $FAILED_JOBS"
+echo "  Pending jobs   : $PENDING"
 echo ""
 if [ $CHECKS_FAILED -eq 0 ]; then
   echo -e "${GREEN}All checks passed.${NC}"
