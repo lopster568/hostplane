@@ -82,18 +82,19 @@ else
   read -p "Choice [r/d/s]: " choice
   case "$choice" in
     r)
-      while IFS=$'\t' read -r jid _rest; do
+      while IFS=$'\t' read -r jid site _rest; do
         mysql --defaults-file=/root/.my-hosto.cnf controlplane -e "
           UPDATE jobs SET status='PENDING', attempts=0, started_at=NULL,
             updated_at=NOW() WHERE id='$jid';"
-        echo -e "${GREEN}✓${NC} Reset job $jid"
+        echo -e "${GREEN}✓${NC} Reset job $jid (site: $site)"
       done <<< "$STUCK_PENDING"
       ;;
     d)
-      while IFS=$'\t' read -r jid _rest; do
-        mysql --defaults-file=/root/.my-hosto.cnf controlplane -e \
-          "DELETE FROM jobs WHERE id='$jid';"
-        echo -e "${GREEN}✓${NC} Deleted job $jid"
+      while IFS=$'\t' read -r jid site _rest; do
+        mysql --defaults-file=/root/.my-hosto.cnf controlplane -e "
+          DELETE FROM jobs WHERE id='$jid';
+          UPDATE sites SET status='FAILED', updated_at=NOW() WHERE job_id='$jid';"
+        echo -e "${GREEN}✓${NC} Deleted job $jid, marked site '$site' FAILED"
       done <<< "$STUCK_PENDING"
       ;;
     *)
@@ -108,12 +109,16 @@ fi
 echo ""
 echo "[ PROVISIONING ZOMBIES ]"
 
-ZOMBIES=$($MYSQL "SELECT s.site, j.attempts, j.max_attempts,
-    TIMESTAMPDIFF(MINUTE, j.updated_at, NOW()) AS idle_min
+ZOMBIES=$($MYSQL "SELECT s.site,
+    COALESCE(CAST(j.attempts AS CHAR), '?') AS attempts,
+    COALESCE(CAST(j.max_attempts AS CHAR), '?') AS max_att,
+    COALESCE(CAST(TIMESTAMPDIFF(MINUTE, j.updated_at, NOW()) AS CHAR),
+             CAST(TIMESTAMPDIFF(MINUTE, s.updated_at, NOW()) AS CHAR)) AS idle_min
   FROM sites s
-  JOIN jobs j ON s.job_id = j.id
+  LEFT JOIN jobs j ON s.job_id = j.id
   WHERE s.status = 'PROVISIONING'
-    AND j.status  = 'FAILED';" 2>/dev/null)
+    AND (j.status = 'FAILED' OR j.id IS NULL)
+  ORDER BY s.updated_at;" 2>/dev/null)
 
 if [ -z "$ZOMBIES" ]; then
   echo -e "${GREEN}✓${NC} No zombie PROVISIONING sites"
