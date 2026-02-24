@@ -1,0 +1,8 @@
+control-plane
+.env
+certs/
+cloudflared/
+initdb/
+*.md
+scripts/
+.git/
