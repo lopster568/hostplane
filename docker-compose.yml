@@ -32,7 +32,7 @@ services:
       mysql:
         condition: service_healthy
     networks:
-      - internal
+      - wp_backend
 
   # ── MariaDB ───────────────────────────────────────────────────────────────
   mysql:
@@ -54,11 +54,11 @@ services:
       retries: 10
       start_period: 30s
     networks:
-      - internal
+      - wp_backend
 
 volumes:
   mysql_data:
 
 networks:
-  internal:
-    driver: bridge
+  wp_backend:
+    external: true
