@@ -106,10 +106,10 @@ else
 fi
 
 # Caddyfile has import line
-if $DOCKER exec caddy grep -q 'import /etc/caddy/sites/\*' /etc/caddy/Caddyfile 2>/dev/null; then
-  pass "Caddyfile has import /etc/caddy/sites/*"
+if $DOCKER exec caddy grep -q 'import /etc/caddy/sites/\*\.caddy' /etc/caddy/Caddyfile 2>/dev/null; then
+  pass "Caddyfile has import /etc/caddy/sites/*.caddy"
 else
-  fail "Caddyfile MISSING 'import /etc/caddy/sites/*' — per-site snippets will not be loaded"
+  fail "Caddyfile MISSING 'import /etc/caddy/sites/*.caddy' — per-site snippets will not be loaded"
 fi
 
 echo ""

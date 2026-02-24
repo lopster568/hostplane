@@ -221,10 +221,14 @@ func (p *Provisioner) writeCaddyConfig(site, phpName, defaultDomain string, cust
 	}
 
 	conf := fmt.Sprintf(`%s {
-    root * /var/www/html
-    php_fastcgi %s:9000
-    file_server
     encode gzip
+    reverse_proxy %s:9000 {
+        transport fastcgi {
+            root /var/www/html
+            split .php
+            index index.php
+        }
+    }
 }
 `, hosts, phpName)
 
