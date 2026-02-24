@@ -10,6 +10,7 @@ import (
 	"github.com/docker/docker/client"
 	_ "github.com/go-sql-driver/mysql"
 )
+
 type Destroyer struct {
 	docker *client.Client
 	cfg    Config
@@ -20,10 +21,10 @@ func NewDestroyer(docker *client.Client, cfg Config) *Destroyer {
 }
 
 func (d *Destroyer) Run(site string) error {
-	dbName     := "wp_" + site
-	dbUser     := "u_" + site
-	volumeName := "vol_" + site
-	phpName    := "php_" + site
+	dbName := WPDatabaseName(site)
+	dbUser := WPDatabaseUser(site)
+	volumeName := VolumeName(site)
+	phpName := PHPContainerName(site)
 
 	if err := d.removeContainer(phpName); err != nil {
 		return fmt.Errorf("removeContainer: %w", err)
@@ -97,7 +98,7 @@ func (d *Destroyer) dropDatabase(dbName, dbUser string) error {
 
 	stmts := []string{
 		"DROP DATABASE IF EXISTS " + dbName,
-		fmt.Sprintf("DROP USER IF EXISTS '%s'@'10.10.0.10'", dbUser),
+		fmt.Sprintf("DROP USER IF EXISTS '%s'@'%s'", dbUser, d.cfg.AppServerIP),
 	}
 	for _, stmt := range stmts {
 		if _, err := db.Exec(stmt); err != nil {

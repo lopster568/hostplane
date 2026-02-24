@@ -2,12 +2,13 @@ package main
 
 import (
 	"archive/tar"
-    	"bytes"
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
-	"time"
 	"log"
+	"time"
+
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/mount"
@@ -16,6 +17,7 @@ import (
 	"github.com/docker/docker/client"
 	_ "github.com/go-sql-driver/mysql"
 )
+
 type Provisioner struct {
 	docker *client.Client
 	cfg    Config
@@ -26,99 +28,99 @@ func NewProvisioner(docker *client.Client, cfg Config) *Provisioner {
 }
 
 func (p *Provisioner) Run(site string) error {
-    dbName  := "wp_" + site
-    dbUser  := "u_" + site
-    dbPass  := "pass_" + site   // ← add this line
-    volName := "vol_" + site
-    phpName := "php_" + site
-    domain  := site + "." + p.cfg.BaseDomain
+	dbName := WPDatabaseName(site)
+	dbUser := WPDatabaseUser(site)
+	dbPass := WPDatabasePass(site)
+	volName := VolumeName(site)
+	phpName := PHPContainerName(site)
+	domain := SiteDomain(site, p.cfg.BaseDomain)
 
-    // Track what succeeded for rollback
-    var dbCreated, volCreated, containerCreated, nginxWritten bool
+	// Track what succeeded for rollback
+	var dbCreated, volCreated, containerCreated, nginxWritten bool
 
-    // Rollback function — runs in reverse order
-    rollback := func(reason error) error {
-        log.Printf("[rollback] triggered for %s: %v", site, reason)
+	// Rollback function — runs in reverse order
+	rollback := func(reason error) error {
+		log.Printf("[rollback] triggered for %s: %v", site, reason)
 
-        if nginxWritten {
-            p.removeNginxConfig(site)
-            reloadNginx(p.cfg)
-        }
-        if containerCreated {
-            ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-            defer cancel()
-            p.docker.ContainerStop(ctx, phpName, container.StopOptions{})
-            p.docker.ContainerRemove(ctx, phpName, types.ContainerRemoveOptions{Force: true})
-        }
-        if volCreated {
-            ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-            defer cancel()
-            p.docker.VolumeRemove(ctx, volName, true)
-        }
-        if dbCreated {
-            p.dropDatabase(dbName, dbUser)
-        }
+		if nginxWritten {
+			p.removeNginxConfig(site)
+			reloadNginx(p.cfg)
+		}
+		if containerCreated {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			p.docker.ContainerStop(ctx, phpName, container.StopOptions{})
+			p.docker.ContainerRemove(ctx, phpName, types.ContainerRemoveOptions{Force: true})
+		}
+		if volCreated {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			p.docker.VolumeRemove(ctx, volName, true)
+		}
+		if dbCreated {
+			p.dropDatabase(dbName, dbUser)
+		}
 
-        return fmt.Errorf("provisioning failed (rolled back): %w", reason)
-    }
+		return fmt.Errorf("provisioning failed (rolled back): %w", reason)
+	}
 
-    // Step 1
-    if err := p.createDatabase(dbName, dbUser, dbPass); err != nil {
-        return rollback(fmt.Errorf("createDatabase: %w", err))
-    }
-    dbCreated = true
+	// Step 1
+	if err := p.createDatabase(dbName, dbUser, dbPass); err != nil {
+		return rollback(fmt.Errorf("createDatabase: %w", err))
+	}
+	dbCreated = true
 
-    // Step 2
-    if err := p.createVolume(volName); err != nil {
-        return rollback(fmt.Errorf("createVolume: %w", err))
-    }
-    volCreated = true
+	// Step 2
+	if err := p.createVolume(volName); err != nil {
+		return rollback(fmt.Errorf("createVolume: %w", err))
+	}
+	volCreated = true
 
-    // Step 3
-    if err := p.createContainer(phpName, volName, dbName, dbUser, dbPass); err != nil {
-        return rollback(fmt.Errorf("createContainer: %w", err))
-    }
-    containerCreated = true
+	// Step 3
+	if err := p.createContainer(phpName, volName, dbName, dbUser, dbPass); err != nil {
+		return rollback(fmt.Errorf("createContainer: %w", err))
+	}
+	containerCreated = true
 
-    // Step 4
-    if err := p.writeNginxConfig(site, phpName, domain); err != nil {
-        return rollback(fmt.Errorf("writeNginxConfig: %w", err))
-    }
-    nginxWritten = true
+	// Step 4
+	if err := p.writeNginxConfig(site, phpName, domain); err != nil {
+		return rollback(fmt.Errorf("writeNginxConfig: %w", err))
+	}
+	nginxWritten = true
 
-    // Step 5
-    if err := reloadNginx(p.cfg); err != nil {
-        return rollback(fmt.Errorf("reloadNginx: %w", err))
-    }
+	// Step 5
+	if err := reloadNginx(p.cfg); err != nil {
+		return rollback(fmt.Errorf("reloadNginx: %w", err))
+	}
 
-    return nil
+	return nil
 }
 
 func (p *Provisioner) dropDatabase(dbName, dbUser string) {
-     db, err := sql.Open("mysql", p.cfg.WordPressDSN) 
-if err != nil {
-        log.Printf("[rollback] cannot open DB connection: %v", err)
-        return
-    }
-    defer db.Close()
-    db.Exec("DROP DATABASE IF EXISTS " + dbName)
-    db.Exec("DROP USER IF EXISTS '" + dbUser + "'@'10.10.0.10'")
-    log.Printf("[rollback] dropped DB %s and user %s", dbName, dbUser)
+	db, err := sql.Open("mysql", p.cfg.WordPressDSN)
+	if err != nil {
+		log.Printf("[rollback] cannot open DB connection: %v", err)
+		return
+	}
+	defer db.Close()
+	db.Exec("DROP DATABASE IF EXISTS " + dbName)
+	db.Exec("DROP USER IF EXISTS '" + dbUser + "'@'" + p.cfg.AppServerIP + "'")
+	log.Printf("[rollback] dropped DB %s and user %s", dbName, dbUser)
 }
 
 func (p *Provisioner) removeNginxConfig(site string) {
-    ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-    defer cancel()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 
-    execResp, err := p.docker.ContainerExecCreate(ctx, p.cfg.NginxContainer, types.ExecConfig{
-        Cmd: []string{"rm", "-f", "/etc/nginx/conf.d/" + site + ".conf"},
-    })
-    if err != nil {
-        log.Printf("[rollback] cannot create exec for nginx config removal: %v", err)
-        return
-    }
-    p.docker.ContainerExecStart(ctx, execResp.ID, types.ExecStartCheck{})
-    log.Printf("[rollback] removed nginx config for %s", site)
+	execResp, err := p.docker.ContainerExecCreate(ctx, p.cfg.NginxContainer, types.ExecConfig{
+		Cmd: []string{"rm", "-f", "/etc/nginx/conf.d/" + site + ".conf"},
+	})
+	if err != nil {
+		log.Printf("[rollback] cannot create exec for nginx config removal: %v", err)
+		return
+	}
+	p.docker.ContainerExecStart(ctx, execResp.ID, types.ExecStartCheck{})
+	log.Printf("[rollback] removed nginx config for %s", site)
 }
 
 func (p *Provisioner) createDatabase(dbName, dbUser, dbPass string) error {
@@ -134,8 +136,8 @@ func (p *Provisioner) createDatabase(dbName, dbUser, dbPass string) error {
 
 	stmts := []string{
 		"CREATE DATABASE IF NOT EXISTS " + dbName,
-		fmt.Sprintf("CREATE USER IF NOT EXISTS '%s'@'10.10.0.10' IDENTIFIED BY '%s'", dbUser, dbPass),
-		fmt.Sprintf("GRANT ALL PRIVILEGES ON %s.* TO '%s'@'10.10.0.10'", dbName, dbUser),
+		fmt.Sprintf("CREATE USER IF NOT EXISTS '%s'@'%s' IDENTIFIED BY '%s'", dbUser, p.cfg.AppServerIP, dbPass),
+		fmt.Sprintf("GRANT ALL PRIVILEGES ON %s.* TO '%s'@'%s'", dbName, dbUser, p.cfg.AppServerIP),
 		"FLUSH PRIVILEGES",
 	}
 	for _, stmt := range stmts {
@@ -194,7 +196,7 @@ func (p *Provisioner) createContainer(phpName, volumeName, dbName, dbUser, dbPas
 		},
 		&network.NetworkingConfig{
 			EndpointsConfig: map[string]*network.EndpointSettings{
-				"wp_backend": {},
+				p.cfg.DockerNetwork: {},
 			},
 		},
 		nil,
@@ -208,12 +210,12 @@ func (p *Provisioner) createContainer(phpName, volumeName, dbName, dbUser, dbPas
 }
 
 func (p *Provisioner) writeNginxConfig(site, phpName, defaultDomain string, customDomain ...string) error {
-    serverName := defaultDomain
-    if len(customDomain) > 0 && customDomain[0] != "" {
-        serverName = defaultDomain + " " + customDomain[0]
-    }
+	serverName := defaultDomain
+	if len(customDomain) > 0 && customDomain[0] != "" {
+		serverName = defaultDomain + " " + customDomain[0]
+	}
 
-    conf := fmt.Sprintf(`server {
+	conf := fmt.Sprintf(`server {
     listen 80;
     server_name %s;
     root /var/www/html;
@@ -236,20 +238,20 @@ func (p *Provisioner) writeNginxConfig(site, phpName, defaultDomain string, cust
 }
 `, serverName, phpName)
 
-    var buf bytes.Buffer
-    tw := tar.NewWriter(&buf)
-    content := []byte(conf)
-    tw.WriteHeader(&tar.Header{
-        Name: site + ".conf",
-        Mode: 0644,
-        Size: int64(len(content)),
-    })
-    tw.Write(content)
-    tw.Close()
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	content := []byte(conf)
+	tw.WriteHeader(&tar.Header{
+		Name: site + ".conf",
+		Mode: 0644,
+		Size: int64(len(content)),
+	})
+	tw.Write(content)
+	tw.Close()
 
-    ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-    defer cancel()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 
-    return p.docker.CopyToContainer(ctx, p.cfg.NginxContainer,
-        p.cfg.NginxConfDir, &buf, types.CopyToContainerOptions{})
+	return p.docker.CopyToContainer(ctx, p.cfg.NginxContainer,
+		p.cfg.NginxConfDir, &buf, types.CopyToContainerOptions{})
 }
