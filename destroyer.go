@@ -32,11 +32,11 @@ func (d *Destroyer) Run(site string) error {
 	if err := d.removeVolume(volumeName); err != nil {
 		return fmt.Errorf("removeVolume: %w", err)
 	}
-	if err := d.removeNginxConfig(site); err != nil {
-		return fmt.Errorf("removeNginxConfig: %w", err)
+	if err := d.removeCaddyConfig(site); err != nil {
+		return fmt.Errorf("removeCaddyConfig: %w", err)
 	}
-	if err := reloadNginx(d.cfg); err != nil {
-		return fmt.Errorf("reloadNginx: %w", err)
+	if err := reloadCaddy(d.cfg); err != nil {
+		return fmt.Errorf("reloadCaddy: %w", err)
 	}
 	if err := d.dropDatabase(dbName, dbUser); err != nil {
 		return fmt.Errorf("dropDatabase: %w", err)
@@ -69,13 +69,12 @@ func (d *Destroyer) removeVolume(volumeName string) error {
 	return nil
 }
 
-func (d *Destroyer) removeNginxConfig(site string) error {
-	// Execute rm inside the container directly
+func (d *Destroyer) removeCaddyConfig(site string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	confPath := d.cfg.NginxConfDir + "/" + site + ".conf"
-	execResp, err := d.docker.ContainerExecCreate(ctx, d.cfg.NginxContainer, types.ExecConfig{
+	confPath := d.cfg.CaddyConfDir + "/" + CaddyConfFile(site)
+	execResp, err := d.docker.ContainerExecCreate(ctx, d.cfg.CaddyContainer, types.ExecConfig{
 		Cmd: []string{"rm", "-f", confPath},
 	})
 	if err != nil {

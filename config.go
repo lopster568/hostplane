@@ -28,7 +28,7 @@ type Config struct {
 	BaseDomain string
 
 	// Infrastructure
-	AppServerIP           string // IP of the app server (containers + nginx)
+	AppServerIP           string // IP of the app server (containers + caddy)
 	DockerNetwork         string // Docker network for site containers
 	CloudflaredConfigPath string // path to cloudflared config.yml
 	TunnelName            string // Cloudflare tunnel name

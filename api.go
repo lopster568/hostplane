@@ -76,16 +76,16 @@ func (a *API) handleSetCustomDomain(c *gin.Context) {
 	}
 
 	// ── Apply Infra FIRST ────────────────────────────────────────────
-	// Step 1: Regenerate nginx config with new domain
-	if err := a.regenerateNginx(site, existing.Domain, domain); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "nginx update failed: " + err.Error()})
+	// Step 1: Regenerate Caddy config with new domain
+	if err := a.regenerateCaddy(site, existing.Domain, domain); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "caddy update failed: " + err.Error()})
 		return
 	}
 
 	// Step 2: Add tunnel DNS route
 	if err := a.tunnel.AddRoute(domain); err != nil {
-		// Rollback step 1: restore previous nginx config
-		a.regenerateNginx(site, existing.Domain, existing.CustomDomain)
+		// Rollback step 1: restore previous Caddy config
+		a.regenerateCaddy(site, existing.Domain, existing.CustomDomain)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "tunnel route failed: " + err.Error()})
 		return
 	}
@@ -94,7 +94,7 @@ func (a *API) handleSetCustomDomain(c *gin.Context) {
 	if err := a.tunnel.UpdateConfig(domain); err != nil {
 		// Rollback steps 1-2
 		a.tunnel.RemoveRoute(domain)
-		a.regenerateNginx(site, existing.Domain, existing.CustomDomain)
+		a.regenerateCaddy(site, existing.Domain, existing.CustomDomain)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "cloudflared config failed: " + err.Error()})
 		return
 	}
@@ -139,16 +139,16 @@ func (a *API) handleRemoveCustomDomain(c *gin.Context) {
 	customDomain := existing.CustomDomain
 
 	// ── Remove Infra FIRST ───────────────────────────────────────────
-	// Step 1: Regenerate nginx config without the custom domain
-	if err := a.regenerateNginx(site, existing.Domain, ""); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "nginx update failed: " + err.Error()})
+	// Step 1: Regenerate Caddy config without the custom domain
+	if err := a.regenerateCaddy(site, existing.Domain, ""); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "caddy update failed: " + err.Error()})
 		return
 	}
 
 	// Step 2: Remove from cloudflared config and restart (synchronous)
 	if err := a.tunnel.RemoveConfig(customDomain); err != nil {
-		// Rollback step 1: restore nginx with the custom domain
-		a.regenerateNginx(site, existing.Domain, customDomain)
+		// Rollback step 1: restore Caddy with the custom domain
+		a.regenerateCaddy(site, existing.Domain, customDomain)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "cloudflared config removal failed: " + err.Error()})
 		return
 	}
@@ -173,8 +173,8 @@ func (a *API) handleRemoveCustomDomain(c *gin.Context) {
 	})
 }
 
-func (a *API) regenerateNginx(site, defaultDomain, customDomain string) error {
-	// Check job type to determine nginx config format
+func (a *API) regenerateCaddy(site, defaultDomain, customDomain string) error {
+	// Check job type to determine Caddy config format
 	existing, err := a.db.GetSite(site)
 	if err != nil {
 		return err
@@ -187,11 +187,11 @@ func (a *API) regenerateNginx(site, defaultDomain, customDomain string) error {
 
 	if job.Type == JobStaticProvision {
 		sp := NewStaticProvisioner(a.docker, a.cfg)
-		return sp.writeNginxConfig(site, StaticContainerName(site), defaultDomain, customDomain)
+		return sp.writeCaddyConfig(site, defaultDomain, customDomain)
 	}
 
 	p := NewProvisioner(a.docker, a.cfg)
-	return p.writeNginxConfig(site, PHPContainerName(site), defaultDomain, customDomain)
+	return p.writeCaddyConfig(site, PHPContainerName(site), defaultDomain, customDomain)
 }
 
 // POST /api/static/provision
