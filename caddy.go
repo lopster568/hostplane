@@ -1,17 +1,14 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"os"
 	"os/exec"
-	"strings"
 	"time"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/client"
-	"github.com/docker/docker/pkg/stdcopy"
 )
 
 // ensureCaddyConfDir creates the per-site snippet directory inside the Caddy
@@ -75,28 +72,38 @@ func PollCaddyCert(docker *client.Client, cfg Config, domain string, timeout tim
 	return CertPending
 }
 
-// caddyHasCert execs `caddy list-certificates` in the Caddy container and
-// returns true if the domain appears in the output.
+// caddyHasCert checks whether Caddy has a TLS certificate for domain by
+// testing for the cert file in Caddy's on-disk ACME storage. This is more
+// reliable than `caddy list-certificates` which was removed in newer Caddy
+// versions. Caddy stores ACME certs at:
+//
+//	/data/caddy/certificates/acme-v02.api.letsencrypt.org-directory/<domain>/<domain>.crt
 func caddyHasCert(docker *client.Client, cfg Config, domain string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	certPath := "/data/caddy/certificates/acme-v02.api.letsencrypt.org-directory/" + domain + "/" + domain + ".crt"
+
 	execResp, err := docker.ContainerExecCreate(ctx, cfg.CaddyContainer, types.ExecConfig{
-		Cmd:          []string{"caddy", "list-certificates"},
-		AttachStdout: true,
-		AttachStderr: true,
+		Cmd: []string{"test", "-f", certPath},
 	})
 	if err != nil {
 		return false
 	}
-
-	resp, err := docker.ContainerExecAttach(ctx, execResp.ID, types.ExecStartCheck{})
-	if err != nil {
+	if err := docker.ContainerExecStart(ctx, execResp.ID, types.ExecStartCheck{}); err != nil {
 		return false
 	}
-	defer resp.Close()
 
-	var stdout, stderr bytes.Buffer
-	stdcopy.StdCopy(&stdout, &stderr, resp.Reader)
-	return strings.Contains(stdout.String(), domain)
+	// Poll for exec completion (test -f is near-instant)
+	for i := 0; i < 20; i++ {
+		time.Sleep(100 * time.Millisecond)
+		inspect, err := docker.ContainerExecInspect(ctx, execResp.ID)
+		if err != nil {
+			return false
+		}
+		if !inspect.Running {
+			return inspect.ExitCode == 0
+		}
+	}
+	return false
 }

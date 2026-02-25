@@ -336,7 +336,52 @@ func (a *API) RegisterRoutes(r *gin.Engine) {
 		v1.POST("/static/provision", a.handleStaticProvision)
 		v1.POST("/sites/:site/domain", a.handleSetCustomDomain)
 		v1.DELETE("/sites/:site/domain", a.handleRemoveCustomDomain)
+		v1.POST("/sites/:site/cert-retry", a.handleCertRetry)
 	}
+}
+
+// POST /api/sites/:site/cert-retry
+//
+// Forces a Caddy reload to re-queue ACME issuance for the site's domain, then
+// polls up to 30 s and returns the live cert_status. Use this when a domain
+// has been pending for more than ~10 minutes.
+func (a *API) handleCertRetry(c *gin.Context) {
+	site := c.Param("site")
+
+	s, err := a.db.GetSite(site)
+	if err == sql.ErrNoRows {
+		c.JSON(http.StatusNotFound, gin.H{"error": "site not found"})
+		return
+	}
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch site"})
+		return
+	}
+	if s.Status != "ACTIVE" && s.Status != "DOMAIN_ACTIVE" {
+		c.JSON(http.StatusConflict, gin.H{"error": "site is not active"})
+		return
+	}
+
+	domainToCheck := s.Domain
+	if s.CustomDomain != "" {
+		domainToCheck = s.CustomDomain
+	}
+
+	if err := reloadCaddy(a.cfg); err != nil {
+		log.Printf("[cert-retry] site=%s caddy reload failed: %v", site, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "caddy reload failed: " + err.Error()})
+		return
+	}
+
+	log.Printf("[cert-retry] site=%s domain=%s caddy reloaded, polling cert...", site, domainToCheck)
+	certStatus := PollCaddyCert(a.docker, a.cfg, domainToCheck, 30*time.Second)
+	log.Printf("[cert-retry] site=%s domain=%s cert_status=%s", site, domainToCheck, certStatus)
+
+	c.JSON(http.StatusOK, gin.H{
+		"site":        site,
+		"domain":      domainToCheck,
+		"cert_status": string(certStatus),
+	})
 }
 
 // POST /api/provision
