@@ -11,6 +11,7 @@ import (
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/client"
+	"github.com/docker/docker/pkg/stdcopy"
 )
 
 // ensureCaddyConfDir creates the per-site snippet directory inside the Caddy
@@ -95,7 +96,7 @@ func caddyHasCert(docker *client.Client, cfg Config, domain string) bool {
 	}
 	defer resp.Close()
 
-	var buf bytes.Buffer
-	buf.ReadFrom(resp.Reader)
-	return strings.Contains(buf.String(), domain)
+	var stdout, stderr bytes.Buffer
+	stdcopy.StdCopy(&stdout, &stderr, resp.Reader)
+	return strings.Contains(stdout.String(), domain)
 }
