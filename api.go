@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/docker/docker/client"
 	"github.com/gin-gonic/gin"
@@ -125,11 +126,20 @@ func (a *API) handleSetCustomDomain(c *gin.Context) {
 		return
 	}
 
-	log.Printf("[api] site=%s custom domain set to %s", site, domain)
+	// Poll Caddy for cert readiness (up to 30s). Non-blocking on failure —
+	// Caddy will keep retrying ACME in the background regardless.
+	certStatus := PollCaddyCert(a.docker, a.cfg, domain, 30*time.Second)
+	if certStatus == CertIssued {
+		log.Printf("[api] site=%s custom domain set to %s (cert: issued)", site, domain)
+	} else {
+		log.Printf("[api] site=%s custom domain set to %s (cert: pending — Caddy will retry)", site, domain)
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"site":           site,
 		"default_domain": existing.Domain,
 		"custom_domain":  domain,
+		"cert_status":    string(certStatus),
 		"status":         "active",
 	})
 }
@@ -547,13 +557,29 @@ func (a *API) handleSiteStatus(c *gin.Context) {
 		return
 	}
 
+	// Live cert check — only meaningful for ACTIVE/DOMAIN_ACTIVE sites
+	certStatus := ""
+	if s.Status == "ACTIVE" || s.Status == "DOMAIN_ACTIVE" {
+		domainToCheck := s.Domain
+		if s.CustomDomain != "" {
+			domainToCheck = s.CustomDomain
+		}
+		if caddyHasCert(a.docker, a.cfg, domainToCheck) {
+			certStatus = string(CertIssued)
+		} else {
+			certStatus = string(CertPending)
+		}
+	}
+
 	c.JSON(http.StatusOK, gin.H{
-		"site":       s.Site,
-		"domain":     s.Domain,
-		"status":     s.Status,
-		"job_id":     s.JobID,
-		"created_at": s.CreatedAt,
-		"updated_at": s.UpdatedAt,
+		"site":          s.Site,
+		"domain":        s.Domain,
+		"custom_domain": s.CustomDomain,
+		"status":        s.Status,
+		"cert_status":   certStatus,
+		"job_id":        s.JobID,
+		"created_at":    s.CreatedAt,
+		"updated_at":    s.UpdatedAt,
 	})
 }
 

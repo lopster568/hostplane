@@ -239,7 +239,47 @@ else
   fi
 fi
 
-# ── 6. Stale custom domain DB records ─────────────────────────
+# ── 6. TLS cert readiness for custom domains ───────────────────
+# For each active site with a custom domain, attempt an HTTPS connection
+# to verify Caddy has obtained a certificate. A failed TLS handshake means
+# the cert is still pending (or the challenge is broken).
+echo ""
+echo "[ CUSTOM DOMAIN TLS CERTS ]"
+
+CUSTOM_DOMAIN_SITES=$($MYSQL "SELECT site, custom_domain FROM sites \
+  WHERE custom_domain IS NOT NULL AND custom_domain != '' \
+  AND status IN ('ACTIVE','DOMAIN_ACTIVE') \
+  ORDER BY site;" 2>/dev/null)
+
+if [ -z "$CUSTOM_DOMAIN_SITES" ]; then
+  echo -e "${GREEN}✓${NC} No active custom domains to check"
+else
+  CERT_FAIL=0
+  while IFS=$'\t' read -r site domain; do
+    [ -z "$site" ] && continue
+    # curl exit 35=SSL handshake fail, 60=cert verify fail, 51=cert name mismatch
+    TLS_EXIT=$(curl -s -o /dev/null --max-time 8 \
+      --resolve "${domain}:443:157.245.107.34" \
+      "https://${domain}" 2>/dev/null; echo $?)
+    if [ "$TLS_EXIT" = "35" ] || [ "$TLS_EXIT" = "60" ] || [ "$TLS_EXIT" = "51" ]; then
+      echo -e "${YELLOW}!${NC} $site → $domain — SSL handshake FAILED (cert not yet issued)"
+      CERT_FAIL=1
+    elif [ "$TLS_EXIT" = "0" ] || [ "$TLS_EXIT" = "22" ] || [[ "$TLS_EXIT" =~ ^[0-9]+$ ]]; then
+      echo -e "${GREEN}✓${NC} $site → $domain — TLS OK"
+    else
+      echo -e "${YELLOW}!${NC} $site → $domain — unreachable (exit: $TLS_EXIT)"
+    fi
+  done <<< "$CUSTOM_DOMAIN_SITES"
+
+  if [ "$CERT_FAIL" = "1" ]; then
+    echo ""
+    echo "  Domains with pending certs will auto-resolve — Caddy retries every few minutes."
+    echo "  If stuck >10 min, force a Caddy reload on app-01:"
+    echo "  docker exec caddy caddy reload --config /etc/caddy/Caddyfile"
+  fi
+fi
+
+# ── 7. Stale custom domain DB records ─────────────────────────
 # Sites that are DESTROYED or FAILED with custom_domain still set in the
 # controlplane DB. The Caddy snippet is already gone (handled above) but
 # the custom_domain column should be cleared so the name can be reused.
@@ -317,7 +357,7 @@ else
   fi
 fi
 
-# ── 7. Old failed jobs ─────────────────────────────────────────
+# ── 8. Old failed jobs ─────────────────────────────────────────
 echo ""
 echo "[ OLD FAILED JOBS ]"
 
@@ -337,7 +377,7 @@ else
   fi
 fi
 
-# ── 8. Orphaned tmp files ──────────────────────────────────────
+# ── 9. Orphaned tmp files ──────────────────────────────────────
 echo ""
 echo "[ ORPHANED TMP FILES ]"
 

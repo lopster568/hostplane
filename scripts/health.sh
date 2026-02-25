@@ -221,6 +221,21 @@ else
           fail "  nginx server_name MISSING $CUSTOM_DOMAIN — HTTP_HOST will be wrong"
         fi
       fi
+
+      # TLS check — verify Caddy has obtained a cert and the domain serves HTTPS
+      TLS_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 8 \
+        --resolve "${CUSTOM_DOMAIN}:443:157.245.107.34" \
+        "https://${CUSTOM_DOMAIN}" 2>/dev/null)
+      TLS_EXIT=$?
+      if [ "$TLS_EXIT" = "35" ] || [ "$TLS_EXIT" = "60" ] || [ "$TLS_EXIT" = "51" ]; then
+        fail "  https://${CUSTOM_DOMAIN} — SSL handshake failed (cert not yet issued or invalid)"
+      elif [ "$TLS_EXIT" != "0" ] || [ "$TLS_CODE" = "000" ]; then
+        warn "  https://${CUSTOM_DOMAIN} — no response (DNS/network issue, exit: $TLS_EXIT)"
+      elif [[ "$TLS_CODE" =~ ^[23] ]]; then
+        pass "  https://${CUSTOM_DOMAIN} → $TLS_CODE (TLS OK)"
+      else
+        warn "  https://${CUSTOM_DOMAIN} → $TLS_CODE (TLS OK, non-2xx/3xx)"
+      fi
     fi
 
     # HTTP smoke test through the actual stack

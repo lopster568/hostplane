@@ -67,6 +67,10 @@ func (p *StaticProvisioner) Run(site, zipPath string) error {
 		return rollback(fmt.Errorf("reloadCaddy: %w", err))
 	}
 
+	// Step 4: Poll for TLS cert readiness (non-fatal — Caddy retries in background).
+	certStatus := PollCaddyCert(p.docker, p.cfg, domain, 30*time.Second)
+	log.Printf("[static_provisioner] site=%s cert_status=%s", site, certStatus)
+
 	os.Remove(zipPath)
 	return nil
 }

@@ -111,6 +111,12 @@ func (p *Provisioner) Run(site string) error {
 		return rollback(fmt.Errorf("reloadCaddy: %w", err))
 	}
 
+	// Step 8: Poll for TLS cert readiness (non-fatal — Caddy retries in background).
+	// This prevents the job from completing while the cert is still pending,
+	// giving the caller an accurate cert_status signal via GET /api/sites/:site.
+	certStatus := PollCaddyCert(p.docker, p.cfg, domain, 30*time.Second)
+	log.Printf("[provisioner] site=%s cert_status=%s", site, certStatus)
+
 	return nil
 }
 
