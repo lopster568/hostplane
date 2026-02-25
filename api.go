@@ -239,11 +239,20 @@ func (a *API) regenerateCaddy(site, defaultDomain, customDomain string) error {
 
 	if job.Type == JobStaticProvision {
 		sp := NewStaticProvisioner(a.docker, a.cfg)
-		return sp.writeCaddyConfig(site, defaultDomain, customDomain)
+		if err := sp.writeCaddyConfig(site, defaultDomain, customDomain); err != nil {
+			return err
+		}
+	} else {
+		p := NewProvisioner(a.docker, a.cfg)
+		if err := p.writeCaddyConfig(site, NginxContainerName(site), defaultDomain, customDomain); err != nil {
+			return err
+		}
 	}
 
-	p := NewProvisioner(a.docker, a.cfg)
-	return p.writeCaddyConfig(site, NginxContainerName(site), defaultDomain, customDomain)
+	// Always reload Caddy after writing the snippet so the running config
+	// matches disk immediately. Without this, domain changes are invisible
+	// to Caddy until the next unrelated reload.
+	return reloadCaddy(a.cfg)
 }
 
 // POST /api/static/provision
@@ -602,17 +611,32 @@ func (a *API) handleSiteStatus(c *gin.Context) {
 		return
 	}
 
-	// Live cert check — only meaningful for ACTIVE/DOMAIN_ACTIVE sites
+	// Live infra checks — only meaningful for ACTIVE/DOMAIN_ACTIVE sites
 	certStatus := ""
+	var warnings []string
 	if s.Status == "ACTIVE" || s.Status == "DOMAIN_ACTIVE" {
 		domainToCheck := s.Domain
 		if s.CustomDomain != "" {
 			domainToCheck = s.CustomDomain
 		}
+
+		// 1. Cert check
 		if caddyHasCert(a.docker, a.cfg, domainToCheck) {
 			certStatus = string(CertIssued)
 		} else {
 			certStatus = string(CertPending)
+			warnings = append(warnings, "TLS cert not yet issued — Caddy is retrying ACME in background; call /cert-retry to force")
+		}
+
+		// 2. Caddy snippet exists on disk
+		snippetOK := caddySnippetExists(a.docker, a.cfg, s.Site)
+		if !snippetOK {
+			warnings = append(warnings, "Caddy config snippet missing — site will not be routed; re-provision or call /cert-retry")
+		} else {
+			// 3. Snippet contains the active domain (catches stale snippet after domain move)
+			if !caddySnippetContainsDomain(a.docker, a.cfg, s.Site, domainToCheck) {
+				warnings = append(warnings, "Caddy snippet exists but does not route "+domainToCheck+" — reload may be needed; call /cert-retry")
+			}
 		}
 	}
 
@@ -622,6 +646,7 @@ func (a *API) handleSiteStatus(c *gin.Context) {
 		"custom_domain": s.CustomDomain,
 		"status":        s.Status,
 		"cert_status":   certStatus,
+		"warnings":      warnings,
 		"job_id":        s.JobID,
 		"created_at":    s.CreatedAt,
 		"updated_at":    s.UpdatedAt,

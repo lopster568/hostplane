@@ -72,7 +72,67 @@ func PollCaddyCert(docker *client.Client, cfg Config, domain string, timeout tim
 	return CertPending
 }
 
-// caddyHasCert checks whether Caddy has a TLS certificate for domain by
+// caddySnippetExists returns true if the per-site Caddy snippet file is present
+// inside the Caddy container. A missing snippet means the site is not routed.
+func caddySnippetExists(docker *client.Client, cfg Config, site string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	snippetPath := cfg.CaddyConfDir + "/" + CaddyConfFile(site)
+	execResp, err := docker.ContainerExecCreate(ctx, cfg.CaddyContainer, types.ExecConfig{
+		Cmd: []string{"test", "-f", snippetPath},
+	})
+	if err != nil {
+		return false
+	}
+	if err := docker.ContainerExecStart(ctx, execResp.ID, types.ExecStartCheck{}); err != nil {
+		return false
+	}
+	for i := 0; i < 20; i++ {
+		time.Sleep(100 * time.Millisecond)
+		inspect, err := docker.ContainerExecInspect(ctx, execResp.ID)
+		if err != nil {
+			return false
+		}
+		if !inspect.Running {
+			return inspect.ExitCode == 0
+		}
+	}
+	return false
+}
+
+// caddySnippetContainsDomain returns true if the snippet for the given site
+// contains the expected domain string. Catches stale snippets left over after
+// a domain was moved from one site to another without a reload.
+func caddySnippetContainsDomain(docker *client.Client, cfg Config, site, domain string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	snippetPath := cfg.CaddyConfDir + "/" + CaddyConfFile(site)
+	execResp, err := docker.ContainerExecCreate(ctx, cfg.CaddyContainer, types.ExecConfig{
+		Cmd:          []string{"grep", "-q", domain, snippetPath},
+		AttachStdout: false,
+		AttachStderr: false,
+	})
+	if err != nil {
+		return false
+	}
+	if err := docker.ContainerExecStart(ctx, execResp.ID, types.ExecStartCheck{}); err != nil {
+		return false
+	}
+	for i := 0; i < 20; i++ {
+		time.Sleep(100 * time.Millisecond)
+		inspect, err := docker.ContainerExecInspect(ctx, execResp.ID)
+		if err != nil {
+			return false
+		}
+		if !inspect.Running {
+			return inspect.ExitCode == 0
+		}
+	}
+	return false
+}
+
 // testing for the cert file in Caddy's on-disk ACME storage. This is more
 // reliable than `caddy list-certificates` which was removed in newer Caddy
 // versions. Caddy stores ACME certs at:
