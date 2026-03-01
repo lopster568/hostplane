@@ -53,7 +53,7 @@ func LoadConfig() Config {
 		CaddyStaticVolume:     getEnv("CADDY_STATIC_VOLUME", "caddy_static_sites"),
 		BaseDomain:            getEnv("BASE_DOMAIN", "hosto.com"),
 		AppServerIP:           getEnv("APP_SERVER_IP", "10.10.0.10"),
-		PublicIP:              getEnv("PUBLIC_IP", "157.245.107.34"),
+		PublicIP:              getEnv("PUBLIC_IP", "129.212.247.213"),
 		DockerNetwork:         getEnv("DOCKER_NETWORK", "wp_backend"),
 		CloudflaredConfigPath: getEnv("CLOUDFLARED_CONFIG", "/etc/cloudflared/config.yml"),
 		TunnelName:            getEnv("TUNNEL_NAME", "hosto"),

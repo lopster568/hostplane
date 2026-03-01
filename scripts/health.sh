@@ -224,7 +224,7 @@ else
 
       # TLS check — verify Caddy has obtained a cert and the domain serves HTTPS
       TLS_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 8 \
-        --resolve "${CUSTOM_DOMAIN}:443:157.245.107.34" \
+        --resolve "${CUSTOM_DOMAIN}:443:129.212.247.213" \
         "https://${CUSTOM_DOMAIN}" 2>/dev/null)
       TLS_EXIT=$?
       if [ "$TLS_EXIT" = "35" ] || [ "$TLS_EXIT" = "60" ] || [ "$TLS_EXIT" = "51" ]; then

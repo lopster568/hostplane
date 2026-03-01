@@ -141,7 +141,7 @@ up the new snippet instantly. **Site is live.**
 ```
 Browser
   → Cloudflare (HTTPS termination, DDoS protection)
-    → VPS 157.245.107.34 — nginx TCP forwarder (dumb, no logic)
+    → VPS 129.212.247.213 — nginx TCP forwarder (dumb, no logic)
       → WireGuard tunnel
         → Caddy on app-01
             matches hostname: mysite.cowsaidmoo.tech

@@ -10,7 +10,7 @@ and then provision a new site.
 ```
 Browser
   → Cloudflare (HTTPS / DDoS)
-    → VPS 157.245.107.34 (nginx TCP forwarder)
+    → VPS 129.212.247.213 (nginx TCP forwarder)
       → WireGuard tunnel
         → app-01 Caddy (routing by hostname)
           → nginx_<site> (static files + FastCGI proxy)
@@ -29,9 +29,9 @@ Each WordPress site has three containers:
 
 ## Prerequisites
 
-- app-01 connected to VPS via WireGuard (VPS IP: `157.245.107.34`, app-01 tunnel IP: `10.0.0.2`)
+- app-01 connected to VPS via WireGuard (VPS IP: `129.212.247.213`, app-01 tunnel IP: `10.0.0.2`)
 - MariaDB running on state-01 (`10.10.0.20`)
-- Wildcard DNS `*.cowsaidmoo.tech` → `157.245.107.34` (Cloudflare, orange cloud ON)
+- Wildcard DNS `*.cowsaidmoo.tech` → `129.212.247.213` (Cloudflare, orange cloud ON)
 - Cloudflare SSL mode: **Full (Strict)**
 - Docker installed on app-01
 

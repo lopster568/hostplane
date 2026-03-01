@@ -259,7 +259,7 @@ else
     [ -z "$site" ] && continue
     # curl exit 35=SSL handshake fail, 60=cert verify fail, 51=cert name mismatch
     TLS_EXIT=$(curl -s -o /dev/null --max-time 8 \
-      --resolve "${domain}:443:157.245.107.34" \
+      --resolve "${domain}:443:129.212.247.213" \
       "https://${domain}" 2>/dev/null; echo $?)
     if [ "$TLS_EXIT" = "35" ] || [ "$TLS_EXIT" = "60" ] || [ "$TLS_EXIT" = "51" ]; then
       echo -e "${YELLOW}!${NC} $site → $domain — SSL handshake FAILED (cert not yet issued)"

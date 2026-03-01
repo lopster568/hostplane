@@ -345,8 +345,71 @@ func (a *API) RegisterRoutes(r *gin.Engine) {
 		v1.POST("/static/provision", a.handleStaticProvision)
 		v1.POST("/sites/:site/domain", a.handleSetCustomDomain)
 		v1.DELETE("/sites/:site/domain", a.handleRemoveCustomDomain)
+		v1.GET("/sites/:site/domain/status", a.handleDomainStatus)
 		v1.POST("/sites/:site/cert-retry", a.handleCertRetry)
 	}
+}
+
+// GET /api/sites/:site/domain/status
+//
+// Returns a live snapshot of the custom domain's DNS and TLS state. Safe to
+// poll frequently from the UI — no infra changes are made. Designed for the
+// "add domain" setup flow where the user needs to know:
+//   - what A record value to configure
+//   - whether their DNS change has propagated
+//   - whether the TLS cert has been issued
+func (a *API) handleDomainStatus(c *gin.Context) {
+	site := c.Param("site")
+
+	s, err := a.db.GetSite(site)
+	if err == sql.ErrNoRows {
+		c.JSON(http.StatusNotFound, gin.H{"error": "site not found"})
+		return
+	}
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch site"})
+		return
+	}
+	if s.CustomDomain == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "no custom domain set on this site"})
+		return
+	}
+
+	domain := s.CustomDomain
+
+	// Live DNS check — always fresh, never cached
+	dns := CheckDomainDNS(domain, a.cfg.PublicIP)
+
+	// Live cert check
+	certIssued := caddyHasCert(a.docker, a.cfg, domain)
+	certStatus := string(CertPending)
+	if certIssued {
+		certStatus = string(CertIssued)
+	}
+
+	// Overall readiness: DNS must point correctly AND cert must be issued
+	ready := dns.PointsToIP && certIssued
+
+	// Human-readable step for the UI to display
+	step := "pending_dns"
+	switch {
+	case ready:
+		step = "active"
+	case dns.PointsToIP && !certIssued:
+		step = "pending_cert"
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"domain":      domain,
+		"expected_ip": a.cfg.PublicIP,
+		"dns": gin.H{
+			"ok":       dns.PointsToIP,
+			"resolved": dns.Resolved,
+		},
+		"cert_status": certStatus,
+		"ready":       ready,
+		"step":        step,
+	})
 }
 
 // POST /api/sites/:site/cert-retry

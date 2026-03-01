@@ -8,9 +8,9 @@ and auto-configuring WordPress so the customer never sees the subdomain.
 ## How It Works
 
 ```
-Customer sets A record: phoenixdns.app → 157.245.107.34
+Customer sets A record: phoenixdns.app → 129.212.247.213
 Control plane API called: POST /sites/testsite01/domain { "domain": "phoenixdns.app" }
-    → Verify A record points to 157.245.107.34
+    → Verify A record points to 129.212.247.213
     → Rewrite /opt/caddy/sites/testsite01.caddy with both hostnames
     → Reload Caddy → Let's Encrypt cert issued automatically for phoenixdns.app
     → Rewrite /opt/nginx/sites/testsite01.conf with server_name + $host
@@ -28,7 +28,7 @@ No DNS changes on your side. No Caddy container restarts. Cert is issued in seco
 ### Prerequisites
 
 - Site is ACTIVE at `<site>.cowsaidmoo.tech`
-- Customer has set an A record: `customdomain.com → 157.245.107.34` (Cloudflare proxy OFF)
+- Customer has set an A record: `customdomain.com → 129.212.247.213` (Cloudflare proxy OFF)
 - WordPress is installed on the site (or will be auto-installed — see Part 2)
 
 ---
@@ -44,13 +44,13 @@ dig +short phoenixdns.app
 Expected output:
 
 ```
-157.245.107.34
+129.212.247.213
 ```
 
 If it returns Cloudflare IPs (`104.x.x.x` / `172.x.x.x`) the proxy is still on — tell customer
 to turn off the orange cloud in Cloudflare for that record.
 
-Do NOT proceed until this returns `157.245.107.34`.
+Do NOT proceed until this returns `129.212.247.213`.
 
 ---
 
@@ -255,8 +255,8 @@ Body: { "domain": "phoenixdns.app" }
 ```
 1. DNS check
    → net.LookupHost(domain)
-   → Assert one of the IPs == "157.245.107.34"
-   → If not: return 400 "A record not pointing to 157.245.107.34"
+   → Assert one of the IPs == "129.212.247.213"
+   → If not: return 400 "A record not pointing to 129.212.247.213"
 
 2. Write Caddy config
    → Read /opt/caddy/sites/<site>.caddy via Docker CopyFromContainer

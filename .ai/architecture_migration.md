@@ -30,7 +30,7 @@ Control plane added new sites by:
 ```
 Customer browser
     → Cloudflare (DDoS protection, HTTPS termination)
-        → VPS 157.245.107.34 (nginx — dumb TCP forwarder, no logic)
+        → VPS 129.212.247.213 (nginx — dumb TCP forwarder, no logic)
             → WireGuard encrypted tunnel
                 → app-01 Caddy (routes by hostname)
                     → nginx_<site> (static files + FastCGI proxy)
@@ -175,16 +175,16 @@ DB_ROOT_PASSWORD=control@123
 
 ## What Each Layer Does
 
-| Layer             | Role                                                                  |
-| ----------------- | --------------------------------------------------------------------- |
-| **Cloudflare**    | HTTPS termination, DDoS protection, hides VPS IP                      |
-| **VPS nginx**     | Dumb TCP forwarder — no SSL, no logic, passes raw bytes               |
-| **WireGuard**     | Encrypted tunnel between VPS (157.245.107.34) and app-01 (10.10.0.10) |
-| **Caddy**         | Routes by hostname to the correct `nginx_<site>` sidecar              |
-| **nginx\_<site>** | Serves WordPress static assets, proxies PHP requests to FPM           |
-| **php\_<site>**   | WordPress PHP-FPM, owns the site's files and database connection      |
-| **state-01**      | MariaDB — one database per site                                       |
-| **control-01**    | Go control plane binary — provisions/destroys sites via Docker API    |
+| Layer             | Role                                                                   |
+| ----------------- | ---------------------------------------------------------------------- |
+| **Cloudflare**    | HTTPS termination, DDoS protection, hides VPS IP                       |
+| **VPS nginx**     | Dumb TCP forwarder — no SSL, no logic, passes raw bytes                |
+| **WireGuard**     | Encrypted tunnel between VPS (129.212.247.213) and app-01 (10.10.0.10) |
+| **Caddy**         | Routes by hostname to the correct `nginx_<site>` sidecar               |
+| **nginx\_<site>** | Serves WordPress static assets, proxies PHP requests to FPM            |
+| **php\_<site>**   | WordPress PHP-FPM, owns the site's files and database connection       |
+| **state-01**      | MariaDB — one database per site                                        |
+| **control-01**    | Go control plane binary — provisions/destroys sites via Docker API     |
 
 ---
 

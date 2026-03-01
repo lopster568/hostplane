@@ -128,6 +128,29 @@ func ValidateDomainDNS(domain string) error {
 	return nil
 }
 
+// DNSCheckResult holds the result of a live DNS lookup for a custom domain.
+type DNSCheckResult struct {
+	Resolved   []string // all A records currently returned by DNS
+	PointsToIP bool     // true if any resolved IP matches expectedIP
+}
+
+// CheckDomainDNS performs a live DNS lookup and returns the resolved IPs and
+// whether the domain is pointing to the expected ingress IP. Unlike
+// ValidateDomainPointsToIngress it never returns an error for wrong IPs —
+// it just reports them so the UI can show the current state.
+func CheckDomainDNS(domain, expectedIP string) DNSCheckResult {
+	addrs, err := net.LookupHost(domain)
+	if err != nil {
+		return DNSCheckResult{Resolved: []string{}, PointsToIP: false}
+	}
+	for _, addr := range addrs {
+		if addr == expectedIP {
+			return DNSCheckResult{Resolved: addrs, PointsToIP: true}
+		}
+	}
+	return DNSCheckResult{Resolved: addrs, PointsToIP: false}
+}
+
 // ValidateDomainPointsToIngress verifies the domain's A record resolves to the
 // expected public ingress IP (the VPS TCP forwarder). Custom domains must point
 // here before Caddy can obtain a TLS certificate for them.

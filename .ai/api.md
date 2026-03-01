@@ -31,20 +31,21 @@ Returns `401 Unauthorized` if the key is missing or wrong:
 
 ## Endpoints
 
-| Method   | Path                          | Description                               |
-| -------- | ----------------------------- | ----------------------------------------- |
-| `GET`    | `/api/health`                 | Health check (no auth)                    |
-| `POST`   | `/api/provision`              | Provision a WordPress site                |
-| `POST`   | `/api/static/provision`       | Provision a static site                   |
-| `POST`   | `/api/destroy`                | Destroy a site (queues job)               |
-| `GET`    | `/api/sites`                  | List all sites                            |
-| `GET`    | `/api/sites/:site`            | Get site status + live infra checks       |
-| `DELETE` | `/api/sites/:site`            | Hard delete a DESTROYED site record       |
-| `POST`   | `/api/sites/:site/domain`     | Set a custom domain                       |
-| `DELETE` | `/api/sites/:site/domain`     | Remove the custom domain                  |
-| `POST`   | `/api/sites/:site/cert-retry` | Force Caddy reload + poll cert            |
-| `GET`    | `/api/jobs/:id`               | Get job status                            |
-| `DELETE` | `/api/jobs/:id`               | Hard delete a completed/failed job record |
+| Method   | Path                             | Description                               |
+| -------- | -------------------------------- | ----------------------------------------- |
+| `GET`    | `/api/health`                    | Health check (no auth)                    |
+| `POST`   | `/api/provision`                 | Provision a WordPress site                |
+| `POST`   | `/api/static/provision`          | Provision a static site                   |
+| `POST`   | `/api/destroy`                   | Destroy a site (queues job)               |
+| `GET`    | `/api/sites`                     | List all sites                            |
+| `GET`    | `/api/sites/:site`               | Get site status + live infra checks       |
+| `DELETE` | `/api/sites/:site`               | Hard delete a DESTROYED site record       |
+| `POST`   | `/api/sites/:site/domain`        | Set a custom domain                       |
+| `DELETE` | `/api/sites/:site/domain`        | Remove the custom domain                  |
+| `GET`    | `/api/sites/:site/domain/status` | Live DNS + cert status (poll from UI)     |
+| `POST`   | `/api/sites/:site/cert-retry`    | Force Caddy reload + poll cert            |
+| `GET`    | `/api/jobs/:id`                  | Get job status                            |
+| `DELETE` | `/api/jobs/:id`                  | Hard delete a completed/failed job record |
 
 ---
 
@@ -334,6 +335,98 @@ subdomain only, reloads Caddy, and for WordPress sites reverts nginx
 
 ---
 
+## `GET /api/sites/:site/domain/status`
+
+Returns a live snapshot of the custom domain's DNS propagation and TLS cert
+state. **No infra changes are made** — safe to poll every few seconds from the
+UI during the "add domain" setup flow.
+
+Designed to power a setup checklist like:
+
+```
+[ ] Point phoenixdns.app → 129.212.247.213   ← dns.ok
+[ ] TLS certificate issued                  ← cert_status == "issued"
+```
+
+**Response `200`**
+
+```json
+{
+  "domain": "phoenixdns.app",
+  "expected_ip": "129.212.247.213",
+  "dns": {
+    "ok": true,
+    "resolved": ["129.212.247.213"]
+  },
+  "cert_status": "issued",
+  "ready": true,
+  "step": "active"
+}
+```
+
+**`step` values**
+
+| Value          | Meaning                                          |
+| -------------- | ------------------------------------------------ |
+| `pending_dns`  | A record not yet pointing to the VPS IP          |
+| `pending_cert` | DNS is correct but TLS cert not issued yet       |
+| `active`       | DNS correct + cert issued — domain is fully live |
+
+**DNS not yet propagated example**
+
+```json
+{
+  "domain": "phoenixdns.app",
+  "expected_ip": "129.212.247.213",
+  "dns": {
+    "ok": false,
+    "resolved": ["1.2.3.4"]
+  },
+  "cert_status": "pending",
+  "ready": false,
+  "step": "pending_dns"
+}
+```
+
+**DNS correct, cert pending example**
+
+```json
+{
+  "domain": "phoenixdns.app",
+  "expected_ip": "129.212.247.213",
+  "dns": {
+    "ok": true,
+    "resolved": ["129.212.247.213"]
+  },
+  "cert_status": "pending",
+  "ready": false,
+  "step": "pending_cert"
+}
+```
+
+**Errors**
+
+| Code  | Reason                            |
+| ----- | --------------------------------- |
+| `400` | No custom domain set on this site |
+| `404` | Site not found                    |
+
+**Typical UI polling loop**
+
+```js
+// Poll every 5s until ready
+const poll = setInterval(async () => {
+  const res = await fetch(`/api/sites/${site}/domain/status`, {
+    headers: { "X-API-Key": key },
+  });
+  const data = await res.json();
+  updateUI(data.step, data.dns, data.cert_status);
+  if (data.ready) clearInterval(poll);
+}, 5000);
+```
+
+---
+
 ## `POST /api/sites/:site/cert-retry`
 
 Forces a Caddy reload to re-queue ACME certificate issuance for the site's
@@ -487,13 +580,28 @@ curl -s -H "X-API-Key: $KEY" \
   https://api.cowsaidmoo.tech/api/sites/mysite | jq '{cert_status,warnings}'
 ```
 
-### Set a custom domain
+### Set a custom domain and watch it go live
 
 ```bash
-# DNS A record for example.com must point to 157.245.107.34 first
+# Step 1 — tell the user to set their A record, then POST the domain
+# (the API validates DNS is already pointing before accepting)
 curl -s -X POST https://api.cowsaidmoo.tech/api/sites/mysite/domain \
   -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
   -d '{"domain":"example.com"}' | jq '{custom_domain,cert_status}'
+
+# Step 2 — poll domain/status from the UI until ready=true
+# step: pending_dns → pending_cert → active
+watch -n 5 'curl -s -H "X-API-Key: $KEY" \
+  https://api.cowsaidmoo.tech/api/sites/mysite/domain/status \
+  | jq "{step,dns_ok: .dns.ok, cert_status, ready}"'
+```
+
+**UI response progression:**
+
+```
+step=pending_dns  → show "Point example.com → 129.212.247.213"
+step=pending_cert → show "DNS verified ✓  Waiting for TLS cert..."
+step=active       → show "Domain live ✓"
 ```
 
 ### Force cert issuance if stuck

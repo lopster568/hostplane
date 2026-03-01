@@ -6,11 +6,11 @@ Browser → Cloudflare (HTTPS/DDoS) → VPS nginx (TCP forward) → WireGuard tu
 
 Prerequisites
 
-VPS with public IP (157.245.107.34)
+VPS with public IP (129.212.247.213)
 app-01 (home server) connected to VPS via WireGuard tunnel (10.0.0.2)
 Caddy running as Docker container on app-01
 MariaDB running on state-01 (10.10.0.20)
-Wildcard DNS \*.cowsaidmoo.tech → 157.245.107.34 (Cloudflare, orange cloud ON)
+Wildcard DNS \*.cowsaidmoo.tech → 129.212.247.213 (Cloudflare, orange cloud ON)
 Cloudflare SSL mode set to Full (Strict)
 
 Step 1: Create Database (on state-01)
