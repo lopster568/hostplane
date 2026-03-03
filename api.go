@@ -809,6 +809,10 @@ func (a *API) handleRestoreSite(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "backup not configured (R2 credentials missing)"})
 		return
 	}
+	if !dateRe.MatchString(date) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid date format — expected YYYY-MM-DD"})
+		return
+	}
 	if _, err := a.db.GetSite(site); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "site not found"})
 		return

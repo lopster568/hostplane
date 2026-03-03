@@ -12,18 +12,18 @@ Full backup feature implemented and hardened across 9 implementation commits + 1
 
 ## Commits
 
-| #   | Hash      | Scope            | Description                                              |
-| --- | --------- | ---------------- | -------------------------------------------------------- |
-| 1   | `7cec263` | deps             | `aws-sdk-go-v2` packages added to `go.mod`               |
-| 2   | `b7e5590` | schema           | R2 config fields + `last_backup_at` DB column            |
-| 3   | `9d5f475` | backup.go        | R2 client — streaming upload, list, lifecycle delete     |
-| 4   | `93c9701` | backupper.go     | Core backup logic — DB + volume via ephemeral containers |
-| 5   | `fdcf155` | backup_worker.go | Daily scheduler goroutine                                |
-| 6   | `553903b` | destroyer.go     | Pre-destroy safety backup gate                           |
-| 7   | `df1374b` | api.go + main.go | HTTP routes + full startup wiring                        |
-| 8   | `059a105` | docs             | `.ai/backup_plan.md`                                     |
-| 9   | `dd14a45` | docs             | `report.md`                                              |
-| 10  | `cf6987e` | **review**       | **Hardening — 8 bugs fixed (see Review section)**        |
+| #   | Hash      | Scope            | Description                                                     |
+| --- | --------- | ---------------- | --------------------------------------------------------------- |
+| 1   | `7cec263` | deps             | `aws-sdk-go-v2` packages added to `go.mod`                      |
+| 2   | `b7e5590` | schema           | R2 config fields + `last_backup_at` DB column                   |
+| 3   | `9d5f475` | backup.go        | R2 client — streaming upload, list, lifecycle delete            |
+| 4   | `93c9701` | backupper.go     | Core backup logic — DB + volume via ephemeral containers        |
+| 5   | `fdcf155` | backup_worker.go | Daily scheduler goroutine                                       |
+| 6   | `553903b` | destroyer.go     | Pre-destroy safety backup gate                                  |
+| 7   | `df1374b` | api.go + main.go | HTTP routes + full startup wiring                               |
+| 8   | `059a105` | docs             | `.ai/backup_plan.md`                                            |
+| 9   | `dd14a45` | docs             | `report.md`                                                     |
+| 10  | `cf6987e` | **review**       | **Hardening — 8 bugs fixed (see Review section)**               |
 | 11  | `bddaf58` | backup+restore   | `REQUIRE_BACKUP_BEFORE_DESTROY` flag; `RestoreSite` implemented |
 
 ---
@@ -32,11 +32,11 @@ Full backup feature implemented and hardened across 9 implementation commits + 1
 
 ### New files
 
-| File               | Purpose                                                                                                     |
-| ------------------ | ----------------------------------------------------------------------------------------------------------- |
+| File               | Purpose                                                                                                                                 |
+| ------------------ | --------------------------------------------------------------------------------------------------------------------------------------- |
 | `backup.go`        | `R2Client` — `Upload`, `List`, `DeleteOlderThan`, `Download`, `objectExists`, key/path helpers, `stripDockerMux`, `parseDSNCredentials` |
 | `backupper.go`     | `Backupper` — `BackupSite`, `BackupAll`, `BackupDatabase`, `BackupVolume`, `RestoreSite`, `RestoreDatabase`, `RestoreVolume`            |
-| `backup_worker.go` | `BackupWorker` — 24 h ticker, immediate first run, weekly cleanup on every 7th tick                         |
+| `backup_worker.go` | `BackupWorker` — 24 h ticker, immediate first run, weekly cleanup on every 7th tick                                                     |
 
 ### Modified files
 
@@ -44,8 +44,8 @@ Full backup feature implemented and hardened across 9 implementation commits + 1
 | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `config.go`         | Four R2 fields + `RequireBackupBeforeDestroy bool` (default `true`) + `getEnvBool` helper                                                        |
 | `db.go`             | `Site.LastBackupAt *time.Time`; `MigrateSchema()`; `UpdateLastBackupAt()`; updated `GetSite` + `ListSites` queries                               |
-| `destroyer.go`      | `Backupper` injected into `Destroyer`; `Run()` gates backup on `cfg.RequireBackupBeforeDestroy`                                                   |
-| `api.go`            | `Backupper` on `API` struct; 3 new routes; `last_backup_at` in site status response; `handleRestoreSite` fully implemented                        |
+| `destroyer.go`      | `Backupper` injected into `Destroyer`; `Run()` gates backup on `cfg.RequireBackupBeforeDestroy`                                                  |
+| `api.go`            | `Backupper` on `API` struct; 3 new routes; `last_backup_at` in site status response; `handleRestoreSite` fully implemented                       |
 | `main.go`           | `MigrateSchema()` on startup; `NewR2Client` (non-fatal); `NewBackupper`; updated `NewDestroyer` + `NewAPI`; conditional `BackupWorker` goroutine |
 | `go.mod` / `go.sum` | `aws-sdk-go-v2/aws`, `credentials`, `service/s3`, `feature/s3/manager`                                                                           |
 
@@ -70,17 +70,40 @@ BackupSite(site)
 
 No disk writes on control-01. Streams flow: Docker daemon → control-01 memory → R2 multipart upload (10 MB parts).
 
+### Restore flow (per site)
+
+```
+RestoreSite(site, date)
+  ├── validate date format (YYYY-MM-DD)
+  ├── preflight: HeadObject(databases/<site>/<date>.sql.gz)  ← fail fast before any data is touched
+  ├── preflight: HeadObject(volumes/<site>/<date>.tar.gz)
+  ├── RestoreDatabase(site, date)
+  │     R2 Download → gzip.NewReader → mysql:8 stdin (ContainerAttach Stdin:true)
+  │     CloseWrite() → EOF → ContainerWait exit-code check
+  │
+  └── RestoreVolume(site, date)
+        R2 Download → alpine tar -xzf - -C /data stdin
+        CloseWrite() → EOF → ContainerWait exit-code check
+```
+
+⚠️ **Restore does not stop the site's running containers** (`php_<site>` / `nginx_<site>`). For a fully
+consistent restore, quiesce writes first. For WordPress (all InnoDB, dump includes `DROP TABLE IF EXISTS`)
+this is generally safe in practice.
+
 ### Destroy flow (updated)
 
 ```
 Destroyer.Run(site)
-  1. BackupSite(site)  ← blocks; aborts destroy on any backup failure
-  2. removeContainer(php_<site>)
-  3. removeContainer(nginx_<site>)
-  4. removeVolume(wp_<site>)
-  5. removeCaddyConfig(site)
-  6. reloadCaddy()
-  7. dropDatabase(wp_<site>)
+  0. if cfg.RequireBackupBeforeDestroy (default true):
+       BackupSite(site)  ← blocks; aborts destroy on failure
+     else:
+       log warning, skip backup (for dev/debug without R2)
+  1. removeContainer(php_<site>)
+  2. removeContainer(nginx_<site>)
+  3. removeVolume(wp_<site>)
+  4. removeCaddyConfig(site)
+  5. reloadCaddy()
+  6. dropDatabase(wp_<site>)
 ```
 
 ### Scheduler
@@ -106,11 +129,13 @@ Applied idempotently via `db.MigrateSchema()` called from `main()` on every star
 
 ## API Endpoints Added
 
-| Method | Path                             | Behaviour                                                                        |
-| ------ | -------------------------------- | -------------------------------------------------------------------------------- |
-| `POST` | `/api/sites/:site/backup`        | On-demand backup, synchronous, returns `{"site","status","date"}`                |
-| `GET`  | `/api/sites/:site/backups`       | Lists all R2 objects for the site — both DB and volume entries with `size_bytes` |
-| `POST` | `/api/sites/:site/restore/:date` | Restores DB + volume from the given date; r2 nil guard (503), site check (404)   |
+| Method | Path                             | Status codes              | Response shape                                                                                                                                 |
+| ------ | -------------------------------- | ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `POST` | `/api/sites/:site/backup`        | 200 / 503 / 404 / 500     | `{"site":"...", "status":"backed_up", "date":"YYYY-MM-DD"}`                                                                                    |
+| `GET`  | `/api/sites/:site/backups`       | 200 / 503 / 404 / 500     | `{"site":"...", "backups":[{"date":"...","type":"database\|volume","key":"...","size_bytes":N}]}`                                                |
+| `POST` | `/api/sites/:site/restore/:date` | 200 / 503 / 404 / 400 / 500 | `{"site":"...", "date":"YYYY-MM-DD", "status":"restored"}` — 400 on bad date format, 500 if container exits non-zero |
+
+All three return `503` when R2 credentials are absent, `404` when the site does not exist.
 
 `GET /api/sites/:site` now includes `"last_backup_at"` (null until first backup).
 `GET /api/sites` includes `LastBackupAt` via struct serialisation.
