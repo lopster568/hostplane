@@ -129,10 +129,10 @@ Applied idempotently via `db.MigrateSchema()` called from `main()` on every star
 
 ## API Endpoints Added
 
-| Method | Path                             | Status codes              | Response shape                                                                                                                                 |
-| ------ | -------------------------------- | ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
-| `POST` | `/api/sites/:site/backup`        | 200 / 503 / 404 / 500     | `{"site":"...", "status":"backed_up", "date":"YYYY-MM-DD"}`                                                                                    |
-| `GET`  | `/api/sites/:site/backups`       | 200 / 503 / 404 / 500     | `{"site":"...", "backups":[{"date":"...","type":"database\|volume","key":"...","size_bytes":N}]}`                                                |
+| Method | Path                             | Status codes                | Response shape                                                                                                       |
+| ------ | -------------------------------- | --------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `POST` | `/api/sites/:site/backup`        | 200 / 503 / 404 / 500       | `{"site":"...", "status":"backed_up", "date":"YYYY-MM-DD"}`                                                          |
+| `GET`  | `/api/sites/:site/backups`       | 200 / 503 / 404 / 500       | `{"site":"...", "backups":[{"date":"...","type":"database\|volume","key":"...","size_bytes":N}]}`                    |
 | `POST` | `/api/sites/:site/restore/:date` | 200 / 503 / 404 / 400 / 500 | `{"site":"...", "date":"YYYY-MM-DD", "status":"restored"}` — 400 on bad date format, 500 if container exits non-zero |
 
 All three return `503` when R2 credentials are absent, `404` when the site does not exist.
