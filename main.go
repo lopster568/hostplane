@@ -60,12 +60,12 @@ func main() {
 	}
 
 	// ── Wire up components ───────────────────────────────
-	tunnel            := NewTunnelManager(cfg)
-	provisioner       := NewProvisioner(docker, cfg)
+	tunnel := NewTunnelManager(cfg)
+	provisioner := NewProvisioner(docker, cfg)
 	staticProvisioner := NewStaticProvisioner(docker, cfg)
-	backupper         := NewBackupper(docker, cfg, r2, db)
-	destroyer         := NewDestroyer(docker, cfg, backupper)
-	worker            := NewWorker(db, provisioner, destroyer, staticProvisioner, cfg)
+	backupper := NewBackupper(docker, cfg, r2, db)
+	destroyer := NewDestroyer(docker, cfg, backupper)
+	worker := NewWorker(db, provisioner, destroyer, staticProvisioner, cfg)
 	go worker.Start()
 	log.Println("[main] worker started")
 

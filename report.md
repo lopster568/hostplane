@@ -180,6 +180,7 @@ hostplane-backups/
 **Problem:** `mysqldump` or `tar` could fail (wrong credentials, DB not found, volume error) and exit with code 1. Stdout would be empty or partial. The upload would succeed from R2's perspective — a 0-byte or partial `.sql.gz` would be stored. `last_backup_at` would be stamped. The pre-destroy backup gate would give a false green light on corrupt data.
 
 **Fix:** Added `ContainerWait` after upload completes. If exit code ≠ 0:
+
 1. Call `logContainerStderr` to capture and log the error message from the container
 2. If the upload had succeeded (i.e., an object exists in R2), call `r2.deleteObject` to remove the corrupt object
 3. Return an error
