@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/docker/docker/api/types"
@@ -83,6 +84,10 @@ func (b *Backupper) BackupAll() {
 // Mechanism: spawns a short-lived mysql:8 container on app-01 (which is already
 // on the wp_backend network and can reach state-01). Stdout is piped via Docker
 // ContainerAttach → stripDockerMux → gzip → R2.
+//
+// After the upload finishes, ContainerWait is used to verify the exit code.
+// If mysqldump exited non-zero (e.g., wrong credentials, DB not found), any
+// partial/empty object already uploaded to R2 is deleted and an error is returned.
 func (b *Backupper) BackupDatabase(site string) error {
 	if b.r2 == nil {
 		return fmt.Errorf("R2 not configured")
@@ -111,9 +116,9 @@ func (b *Backupper) BackupDatabase(site string) error {
 				"-P", dbPort,
 				"-u", dbUser,
 				fmt.Sprintf("-p%s", dbPass),
-				"--single-transaction",
+				"--single-transaction", // consistent snapshot for InnoDB (WordPress default)
 				"--quick",
-				"--skip-lock-tables",
+				"--set-gtid-purged=OFF", // avoid GTID errors on replica-less setups
 				dbName,
 			},
 			AttachStdout: true,
@@ -121,7 +126,7 @@ func (b *Backupper) BackupDatabase(site string) error {
 		},
 		&container.HostConfig{
 			NetworkMode: container.NetworkMode(b.cfg.DockerNetwork),
-			AutoRemove:  false, // we remove manually after cleanup
+			AutoRemove:  false, // removed explicitly in defer so we can call ContainerWait first
 		},
 		nil, nil, containerName,
 	)
@@ -140,7 +145,7 @@ func (b *Backupper) BackupDatabase(site string) error {
 	attachResp, err := b.docker.ContainerAttach(ctx, createResp.ID, types.ContainerAttachOptions{
 		Stream: true,
 		Stdout: true,
-		Stderr: false,
+		Stderr: false, // captured separately via ContainerLogs on failure
 	})
 	if err != nil {
 		return fmt.Errorf("attach mysqldump container: %w", err)
@@ -167,9 +172,31 @@ func (b *Backupper) BackupDatabase(site string) error {
 
 	key := keyForDB(site, dateStamp())
 	uploadErr := b.r2.Upload(ctx, key, pr, "application/gzip")
+	<-gzDone // wait for gzip goroutine to finish before checking results
 
-	// Wait for gzip goroutine to finish
-	<-gzDone
+	// By this point the container has exited (stdout stream closure = container done).
+	// Check the exit code to detect silent mysqldump failures.
+	exitCode, waitErr := b.waitContainer(ctx, createResp.ID)
+	if waitErr != nil {
+		// Cannot confirm success — treat as failure and clean up any upload
+		if uploadErr == nil {
+			b.r2.deleteObject(context.Background(), key) //nolint
+		}
+		return fmt.Errorf("wait for mysqldump container: %w", waitErr)
+	}
+	if exitCode != 0 {
+		b.logContainerStderr(createResp.ID, fmt.Sprintf("mysqldump site=%s", site))
+		if uploadErr == nil {
+			// The partial/empty object was successfully stored — delete it so R2
+			// never contains a corrupt backup that looks valid.
+			if delErr := b.r2.deleteObject(context.Background(), key); delErr != nil {
+				log.Printf("[backupper] site=%s WARNING: corrupt backup object %s could not be deleted: %v", site, key, delErr)
+			} else {
+				log.Printf("[backupper] site=%s corrupt backup object %s deleted from R2", site, key)
+			}
+		}
+		return fmt.Errorf("mysqldump exited with code %d — backup aborted", exitCode)
+	}
 
 	if uploadErr != nil {
 		return fmt.Errorf("upload DB backup to R2: %w", uploadErr)
@@ -185,6 +212,9 @@ func (b *Backupper) BackupDatabase(site string) error {
 // Mechanism: spawns a short-lived alpine container on app-01 with the site
 // volume mounted read-only. Runs: tar -czf - -C /data . so stdout is the
 // complete tar.gz. Streamed via ContainerAttach → stripDockerMux → R2.
+//
+// ContainerWait is used after upload to verify tar exited cleanly.
+// If non-zero, the uploaded object is deleted from R2 before returning error.
 func (b *Backupper) BackupVolume(site string) error {
 	if b.r2 == nil {
 		return fmt.Errorf("R2 not configured")
@@ -244,8 +274,30 @@ func (b *Backupper) BackupVolume(site string) error {
 	rawStream := stripDockerMux(attachResp.Reader)
 
 	key := keyForVolume(site, dateStamp())
-	if err := b.r2.Upload(ctx, key, rawStream, "application/x-tar"); err != nil {
-		return fmt.Errorf("upload volume backup to R2: %w", err)
+	uploadErr := b.r2.Upload(ctx, key, rawStream, "application/x-tar")
+
+	// Verify tar exited cleanly
+	exitCode, waitErr := b.waitContainer(ctx, createResp.ID)
+	if waitErr != nil {
+		if uploadErr == nil {
+			b.r2.deleteObject(context.Background(), key) //nolint
+		}
+		return fmt.Errorf("wait for volume backup container: %w", waitErr)
+	}
+	if exitCode != 0 {
+		b.logContainerStderr(createResp.ID, fmt.Sprintf("tar site=%s", site))
+		if uploadErr == nil {
+			if delErr := b.r2.deleteObject(context.Background(), key); delErr != nil {
+				log.Printf("[backupper] site=%s WARNING: corrupt volume object %s could not be deleted: %v", site, key, delErr)
+			} else {
+				log.Printf("[backupper] site=%s corrupt volume object %s deleted from R2", site, key)
+			}
+		}
+		return fmt.Errorf("tar exited with code %d — backup aborted", exitCode)
+	}
+
+	if uploadErr != nil {
+		return fmt.Errorf("upload volume backup to R2: %w", uploadErr)
 	}
 
 	log.Printf("[backupper] site=%s volume backup → %s", site, key)
@@ -256,4 +308,63 @@ func (b *Backupper) BackupVolume(site string) error {
 // Phase 2 — not yet implemented.
 func (b *Backupper) RestoreSite(site, date string) error {
 	return fmt.Errorf("restore not yet implemented (phase 2)")
+}
+
+// waitContainer waits for a container to stop and returns its exit code.
+// Safe to call after the container has already exited — returns immediately.
+func (b *Backupper) waitContainer(ctx context.Context, containerID string) (int64, error) {
+	statusCh, errCh := b.docker.ContainerWait(ctx, containerID, container.WaitConditionNotRunning)
+	select {
+	case err := <-errCh:
+		return -1, err
+	case status := <-statusCh:
+		if status.Error != nil {
+			return -1, fmt.Errorf("%s", status.Error.Message)
+		}
+		return status.StatusCode, nil
+	}
+}
+
+// logContainerStderr fetches and logs up to 4 KB of stderr from an exited
+// container. Used for post-mortem diagnostics when a backup container fails.
+// Reads the Docker multiplexed log stream directly — cannot reuse stripDockerMux
+// because that function filters to stdout (type 1) only.
+func (b *Backupper) logContainerStderr(containerID, label string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	logsReader, err := b.docker.ContainerLogs(ctx, containerID, types.ContainerLogsOptions{
+		ShowStdout: false,
+		ShowStderr: true,
+	})
+	if err != nil {
+		log.Printf("[backupper] %s: could not fetch stderr: %v", label, err)
+		return
+	}
+	defer logsReader.Close()
+
+	// Docker mux format: [stream_type(1)] [pad(3)] [size(4)] [data...]
+	// Since ShowStdout=false, every frame here is type 2 (stderr).
+	var buf strings.Builder
+	header := make([]byte, 8)
+	for buf.Len() < 4096 {
+		if _, err := io.ReadFull(logsReader, header); err != nil {
+			break // EOF or connection drop — stop reading
+		}
+		size := int64(header[4])<<24 | int64(header[5])<<16 | int64(header[6])<<8 | int64(header[7])
+		remaining := int64(4096 - buf.Len())
+		if size <= remaining {
+			data := make([]byte, size)
+			io.ReadFull(logsReader, data) //nolint
+			buf.Write(data)
+		} else {
+			data := make([]byte, remaining)
+			io.ReadFull(logsReader, data) //nolint
+			buf.Write(data)
+			io.CopyN(io.Discard, logsReader, size-remaining) //nolint
+		}
+	}
+	if buf.Len() > 0 {
+		log.Printf("[backupper] %s stderr: %s", label, strings.TrimSpace(buf.String()))
+	}
 }

@@ -732,6 +732,10 @@ func (a *API) handleHealth(c *gin.Context) {
 // Runs synchronously — the response is returned once the backup is complete.
 func (a *API) handleBackupSite(c *gin.Context) {
 	site := c.Param("site")
+	if a.backupper.r2 == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "backup not configured (R2 credentials missing)"})
+		return
+	}
 	if _, err := a.db.GetSite(site); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "site not found"})
 		return
@@ -750,6 +754,14 @@ func (a *API) handleBackupSite(c *gin.Context) {
 // Returns separate database and volume entries with dates and sizes.
 func (a *API) handleListBackups(c *gin.Context) {
 	site := c.Param("site")
+	if a.backupper.r2 == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "backup not configured (R2 credentials missing)"})
+		return
+	}
+	if _, err := a.db.GetSite(site); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "site not found"})
+		return
+	}
 	ctx := c.Request.Context()
 
 	dbEntries, err := a.backupper.r2.List(ctx, prefixForSiteDB(site))

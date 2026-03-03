@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"strings"
 	"time"
 
@@ -69,29 +70,41 @@ type BackupEntry struct {
 	Size         int64
 }
 
-// List returns all objects whose key starts with prefix.
+// List returns ALL objects whose key starts with prefix, handling pagination.
+// S3/R2 returns at most 1000 keys per call; this method follows continuation tokens.
 func (r *R2Client) List(ctx context.Context, prefix string) ([]BackupEntry, error) {
-	resp, err := r.s3.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
-		Bucket: aws.String(r.bucket),
-		Prefix: aws.String(prefix),
-	})
-	if err != nil {
-		return nil, err
-	}
+	var entries []BackupEntry
+	var continuationToken *string
 
-	entries := make([]BackupEntry, 0, len(resp.Contents))
-	for _, obj := range resp.Contents {
-		entries = append(entries, BackupEntry{
-			Key:          aws.ToString(obj.Key),
-			LastModified: aws.ToTime(obj.LastModified),
-			Size:         aws.ToInt64(obj.Size),
+	for {
+		resp, err := r.s3.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(r.bucket),
+			Prefix:            aws.String(prefix),
+			ContinuationToken: continuationToken,
 		})
+		if err != nil {
+			return nil, err
+		}
+
+		for _, obj := range resp.Contents {
+			entries = append(entries, BackupEntry{
+				Key:          aws.ToString(obj.Key),
+				LastModified: aws.ToTime(obj.LastModified),
+				Size:         aws.ToInt64(obj.Size),
+			})
+		}
+
+		if !aws.ToBool(resp.IsTruncated) {
+			break
+		}
+		continuationToken = resp.NextContinuationToken
 	}
 	return entries, nil
 }
 
 // DeleteOlderThan deletes all objects under prefix that are older than `days` days.
-// Intended to be called weekly by the backup worker for lifecycle cleanup.
+// Logs and continues on individual delete failures so one bad object does not
+// block cleanup of all the rest.
 func (r *R2Client) DeleteOlderThan(ctx context.Context, prefix string, days int) error {
 	entries, err := r.List(ctx, prefix)
 	if err != nil {
@@ -99,17 +112,28 @@ func (r *R2Client) DeleteOlderThan(ctx context.Context, prefix string, days int)
 	}
 
 	cutoff := time.Now().AddDate(0, 0, -days)
+	var lastErr error
 	for _, e := range entries {
 		if e.LastModified.Before(cutoff) {
-			if _, err := r.s3.DeleteObject(ctx, &s3.DeleteObjectInput{
-				Bucket: aws.String(r.bucket),
-				Key:    aws.String(e.Key),
-			}); err != nil {
-				return fmt.Errorf("delete %s: %w", e.Key, err)
+			if delErr := r.deleteObject(ctx, e.Key); delErr != nil {
+				// log and continue — one failure must not block the rest
+				log.Printf("[r2] cleanup: failed to delete %s: %v", e.Key, delErr)
+				lastErr = delErr
+			} else {
+				log.Printf("[r2] cleanup: deleted %s", e.Key)
 			}
 		}
 	}
-	return nil
+	return lastErr
+}
+
+// deleteObject removes a single object from R2.
+func (r *R2Client) deleteObject(ctx context.Context, key string) error {
+	_, err := r.s3.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(r.bucket),
+		Key:    aws.String(key),
+	})
+	return err
 }
 
 // ── Key / path helpers ──────────────────────────────────────────────────────
@@ -174,7 +198,8 @@ func parseDSNCredentials(dsn string) (user, pass string) {
 // frame, returning a reader of raw stdout bytes.
 //
 // Docker's ContainerAttach response format (per frame):
-//   [stream_type(1)] [pad(3)] [payload_size(4)] [payload...]
+//
+//	[stream_type(1)] [pad(3)] [payload_size(4)] [payload...]
 //
 // stream_type: 1 = stdout, 2 = stderr. We forward stdout only.
 func stripDockerMux(r io.Reader) io.Reader {
@@ -184,7 +209,13 @@ func stripDockerMux(r io.Reader) io.Reader {
 		for {
 			_, err := io.ReadFull(r, header)
 			if err != nil {
-				pw.CloseWithError(err)
+				// io.EOF means the Docker stream closed cleanly (container exited).
+				// Call Close() (not CloseWithError) so the reader sees a normal EOF.
+				if err == io.EOF {
+					pw.Close()
+				} else {
+					pw.CloseWithError(err)
+				}
 				return
 			}
 			size := int64(header[4])<<24 | int64(header[5])<<16 | int64(header[6])<<8 | int64(header[7])
