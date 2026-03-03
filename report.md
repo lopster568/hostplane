@@ -6,7 +6,7 @@
 
 ## Summary
 
-Full backup feature implemented and hardened across 9 implementation commits + 1 review commit. Binary builds cleanly with zero errors and zero vet warnings. A security review caught 8 bugs post-implementation — all fixed before merge.
+Full backup feature implemented and hardened across 9 implementation commits + 1 review commit + 1 phase-2 commit. Binary builds cleanly with zero errors and zero vet warnings. A security review caught 8 bugs post-implementation — all fixed before merge. `RestoreSite` is now fully implemented and the pre-destroy backup gate is controllable via config flag.
 
 ---
 
@@ -24,6 +24,7 @@ Full backup feature implemented and hardened across 9 implementation commits + 1
 | 8   | `059a105` | docs             | `.ai/backup_plan.md`                                     |
 | 9   | `dd14a45` | docs             | `report.md`                                              |
 | 10  | `cf6987e` | **review**       | **Hardening — 8 bugs fixed (see Review section)**        |
+| 11  | `bddaf58` | backup+restore   | `REQUIRE_BACKUP_BEFORE_DESTROY` flag; `RestoreSite` implemented |
 
 ---
 
@@ -33,18 +34,18 @@ Full backup feature implemented and hardened across 9 implementation commits + 1
 
 | File               | Purpose                                                                                                     |
 | ------------------ | ----------------------------------------------------------------------------------------------------------- |
-| `backup.go`        | `R2Client` — `Upload`, `List`, `DeleteOlderThan`, key/path helpers, `stripDockerMux`, `parseDSNCredentials` |
-| `backupper.go`     | `Backupper` — `BackupSite`, `BackupAll`, `BackupDatabase`, `BackupVolume`, `RestoreSite` (stub)             |
+| `backup.go`        | `R2Client` — `Upload`, `List`, `DeleteOlderThan`, `Download`, `objectExists`, key/path helpers, `stripDockerMux`, `parseDSNCredentials` |
+| `backupper.go`     | `Backupper` — `BackupSite`, `BackupAll`, `BackupDatabase`, `BackupVolume`, `RestoreSite`, `RestoreDatabase`, `RestoreVolume`            |
 | `backup_worker.go` | `BackupWorker` — 24 h ticker, immediate first run, weekly cleanup on every 7th tick                         |
 
 ### Modified files
 
 | File                | Changes                                                                                                                                          |
 | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `config.go`         | Four R2 fields added to `Config` struct + `LoadConfig()`                                                                                         |
+| `config.go`         | Four R2 fields + `RequireBackupBeforeDestroy bool` (default `true`) + `getEnvBool` helper                                                        |
 | `db.go`             | `Site.LastBackupAt *time.Time`; `MigrateSchema()`; `UpdateLastBackupAt()`; updated `GetSite` + `ListSites` queries                               |
-| `destroyer.go`      | `Backupper` injected into `Destroyer`; `Run()` blocks on `BackupSite()` before any destructive step                                              |
-| `api.go`            | `Backupper` on `API` struct; 3 new routes; `last_backup_at` in site status response                                                              |
+| `destroyer.go`      | `Backupper` injected into `Destroyer`; `Run()` gates backup on `cfg.RequireBackupBeforeDestroy`                                                   |
+| `api.go`            | `Backupper` on `API` struct; 3 new routes; `last_backup_at` in site status response; `handleRestoreSite` fully implemented                        |
 | `main.go`           | `MigrateSchema()` on startup; `NewR2Client` (non-fatal); `NewBackupper`; updated `NewDestroyer` + `NewAPI`; conditional `BackupWorker` goroutine |
 | `go.mod` / `go.sum` | `aws-sdk-go-v2/aws`, `credentials`, `service/s3`, `feature/s3/manager`                                                                           |
 
@@ -109,7 +110,7 @@ Applied idempotently via `db.MigrateSchema()` called from `main()` on every star
 | ------ | -------------------------------- | -------------------------------------------------------------------------------- |
 | `POST` | `/api/sites/:site/backup`        | On-demand backup, synchronous, returns `{"site","status","date"}`                |
 | `GET`  | `/api/sites/:site/backups`       | Lists all R2 objects for the site — both DB and volume entries with `size_bytes` |
-| `POST` | `/api/sites/:site/restore/:date` | Phase 2 stub — returns `501` with clear message                                  |
+| `POST` | `/api/sites/:site/restore/:date` | Restores DB + volume from the given date; r2 nil guard (503), site check (404)   |
 
 `GET /api/sites/:site` now includes `"last_backup_at"` (null until first backup).
 `GET /api/sites` includes `LastBackupAt` via struct serialisation.
@@ -123,6 +124,7 @@ R2_ACCOUNT_ID=<cloudflare-account-id>
 R2_ACCESS_KEY_ID=<r2-key-id>
 R2_SECRET_ACCESS_KEY=<r2-secret>
 R2_BUCKET=hostplane-backups
+REQUIRE_BACKUP_BEFORE_DESTROY=true   # default; set false to skip pre-destroy backup
 ```
 
 If any of these are absent, the binary starts normally and logs:
@@ -131,7 +133,7 @@ If any of these are absent, the binary starts normally and logs:
 [main] R2 not configured (...) — backups disabled
 ```
 
-The `Destroyer` will block destroy jobs until R2 is configured (pre-destroy backup will always fail without credentials).
+The `Destroyer` respects `REQUIRE_BACKUP_BEFORE_DESTROY` (default `true`). With the flag `true` and no R2, destroy jobs will fail at the pre-destroy backup step. Set it to `false` during development to allow destroys without R2.
 
 ---
 
@@ -165,10 +167,38 @@ hostplane-backups/
 
 ---
 
-## Phase 2 (not implemented — stubs in place)
+## Restore Flow (commit `bddaf58`)
 
-- `RestoreSite(site, date)` — download from R2, pipe to `mysql` container for DB, `tar -xzf` container for volume
+```
+RestoreSite(site, date)
+  1. R2.objectExists(databases/<site>/<date>.sql.gz)  ← preflight, no data touched yet
+  2. R2.objectExists(volumes/<site>/<date>.tar.gz)    ← preflight
+  3. RestoreDatabase
+  │     R2.Download(databases/<site>/<date>.sql.gz)
+  │     gzip.NewReader(stream)
+  │     ephemeral mysql:8 container on app-01 (Stdin open, StdinOnce)
+  │     io.Copy(attachResp.Conn, gzReader) → ContainerAttach stdin
+  │     CloseWrite() → EOF → mysql exits
+  │     ContainerWait exit-code check → logContainerStderr on failure
+  └── RestoreVolume
+        R2.Download(volumes/<site>/<date>.tar.gz)
+        ephemeral alpine container, volume wp_<site> mounted rw at /data
+        tar -xzf - -C /data
+        io.Copy(attachResp.Conn, stream)
+        CloseWrite() → ContainerWait exit-code check
+```
+
+Note: running site containers are **not stopped** automatically. For a fully
+consistent restore, stop the site's `php_<site>` / `nginx_<site>` containers
+before calling the endpoint, then restart them after.
+
+---
+
+## Phase 2 (not implemented)
+
+- ~~`RestoreSite(site, date)`~~ — **done** (commit `bddaf58`)
 - Backup status endpoint (`GET /api/backup/status`) showing last run time and per-site results
+- Stop/restart site containers around a restore for full consistency
 - `configs/` prefix for Caddy snippet exports (low value — regenerated from DB)
 
 ---
