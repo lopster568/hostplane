@@ -136,6 +136,29 @@ func (r *R2Client) deleteObject(ctx context.Context, key string) error {
 	return err
 }
 
+// Download returns a streaming reader for the R2 object at key.
+// The caller is responsible for closing the returned ReadCloser.
+func (r *R2Client) Download(ctx context.Context, key string) (io.ReadCloser, error) {
+	resp, err := r.s3.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(r.bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return resp.Body, nil
+}
+
+// objectExists returns nil if the key exists in R2, or an error otherwise.
+// Uses HeadObject so no data is transferred.
+func (r *R2Client) objectExists(ctx context.Context, key string) error {
+	_, err := r.s3.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(r.bucket),
+		Key:    aws.String(key),
+	})
+	return err
+}
+
 // ── Key / path helpers ──────────────────────────────────────────────────────
 
 // keyForDB returns the R2 object key for a database backup.

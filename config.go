@@ -44,6 +44,11 @@ type Config struct {
 	R2AccessKeyID     string
 	R2SecretAccessKey string
 	R2Bucket          string
+
+	// RequireBackupBeforeDestroy gates destroy jobs on a successful pre-destroy
+	// backup. Defaults to true. Set REQUIRE_BACKUP_BEFORE_DESTROY=false to
+	// skip during development / debugging when R2 is not yet configured.
+	RequireBackupBeforeDestroy bool
 }
 
 func LoadConfig() Config {
@@ -66,10 +71,11 @@ func LoadConfig() Config {
 		ServiceTarget:         getEnv("TUNNEL_SERVICE_TARGET", "http://10.10.0.10:8080"),
 		WorkerPollInterval:    3,
 		StuckJobTimeout:       10,
-		R2AccountID:           getEnv("R2_ACCOUNT_ID", ""),
-		R2AccessKeyID:         getEnv("R2_ACCESS_KEY_ID", ""),
-		R2SecretAccessKey:     getEnv("R2_SECRET_ACCESS_KEY", ""),
-		R2Bucket:              getEnv("R2_BUCKET", "hostplane-backups"),
+		R2AccountID:                getEnv("R2_ACCOUNT_ID", ""),
+		R2AccessKeyID:              getEnv("R2_ACCESS_KEY_ID", ""),
+		R2SecretAccessKey:          getEnv("R2_SECRET_ACCESS_KEY", ""),
+		R2Bucket:                   getEnv("R2_BUCKET", "hostplane-backups"),
+		RequireBackupBeforeDestroy: getEnvBool("REQUIRE_BACKUP_BEFORE_DESTROY", true),
 	}
 }
 
@@ -86,6 +92,14 @@ func mustEnv(key string) string {
 		log.Fatalf("Required env var %s is not set", key)
 	}
 	return v
+}
+
+func getEnvBool(key string, fallback bool) bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
+	if v == "" {
+		return fallback
+	}
+	return v == "true" || v == "1" || v == "yes"
 }
 
 func (c Config) DBHost() string {

@@ -798,12 +798,25 @@ func (a *API) handleListBackups(c *gin.Context) {
 // POST /api/sites/:site/restore/:date
 //
 // Restores both the database and volume from the backup taken on :date (YYYY-MM-DD).
-// Phase 2 — currently returns 501 with a clear message.
+// Runs synchronously — the response is returned once both restores complete.
+// The site's running containers are NOT stopped automatically; quiesce writes
+// first for a fully consistent restore.
 func (a *API) handleRestoreSite(c *gin.Context) {
 	site := c.Param("site")
 	date := c.Param("date")
+
+	if a.backupper.r2 == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "backup not configured (R2 credentials missing)"})
+		return
+	}
+	if _, err := a.db.GetSite(site); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "site not found"})
+		return
+	}
+
 	if err := a.backupper.RestoreSite(site, date); err != nil {
-		c.JSON(http.StatusNotImplemented, gin.H{"error": err.Error()})
+		log.Printf("[api] restore failed site=%s date=%s: %v", site, date, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"site": site, "date": date, "status": "restored"})
