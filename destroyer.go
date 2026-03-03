@@ -12,15 +12,23 @@ import (
 )
 
 type Destroyer struct {
-	docker *client.Client
-	cfg    Config
+	docker    *client.Client
+	cfg       Config
+	backupper *Backupper
 }
 
-func NewDestroyer(docker *client.Client, cfg Config) *Destroyer {
-	return &Destroyer{docker: docker, cfg: cfg}
+func NewDestroyer(docker *client.Client, cfg Config, backupper *Backupper) *Destroyer {
+	return &Destroyer{docker: docker, cfg: cfg, backupper: backupper}
 }
 
 func (d *Destroyer) Run(site string) error {
+	// ── Pre-destroy safety backup ─────────────────────────────────
+	// Must succeed before any data is deleted. If R2 is not configured this
+	// is a hard block — operators should configure R2 before allowing destroys.
+	if err := d.backupper.BackupSite(site); err != nil {
+		return fmt.Errorf("pre-destroy backup failed, aborting destroy: %w", err)
+	}
+
 	dbName := WPDatabaseName(site)
 	dbUser := WPDatabaseUser(site)
 	volumeName := VolumeName(site)
