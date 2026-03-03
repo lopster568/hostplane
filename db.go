@@ -29,6 +29,7 @@ type Site struct {
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
 	CustomDomain string
+	LastBackupAt *time.Time // nullable — nil until first backup
 }
 
 func (d *DB) SetCustomDomain(site, domain string) error {
@@ -92,21 +93,42 @@ func (d *DB) HardDeleteJob(id string) error {
 	return err
 }
 
+func (d *DB) MigrateSchema() error {
+	// Idempotent — ADD COLUMN IF NOT EXISTS requires MySQL 8.0.3+
+	// For older versions we use a conditional approach.
+	_, err := d.conn.Exec(`
+		ALTER TABLE sites
+		ADD COLUMN IF NOT EXISTS last_backup_at DATETIME NULL DEFAULT NULL
+	`)
+	return err
+}
+
+func (d *DB) UpdateLastBackupAt(site string, t time.Time) error {
+	_, err := d.conn.Exec(`
+		UPDATE sites SET last_backup_at=?, updated_at=NOW() WHERE site=?
+	`, t.UTC(), site)
+	return err
+}
+
 func (d *DB) GetSite(site string) (*Site, error) {
 	var s Site
+	var lastBackup sql.NullTime
 	err := d.conn.QueryRow(`
-        SELECT site, domain, COALESCE(custom_domain,''), status, COALESCE(job_id,''), created_at, updated_at
+        SELECT site, domain, COALESCE(custom_domain,''), status, COALESCE(job_id,''), created_at, updated_at, last_backup_at
         FROM sites WHERE site=?
-    `, site).Scan(&s.Site, &s.Domain, &s.CustomDomain, &s.Status, &s.JobID, &s.CreatedAt, &s.UpdatedAt)
+    `, site).Scan(&s.Site, &s.Domain, &s.CustomDomain, &s.Status, &s.JobID, &s.CreatedAt, &s.UpdatedAt, &lastBackup)
 	if err != nil {
 		return nil, err
+	}
+	if lastBackup.Valid {
+		s.LastBackupAt = &lastBackup.Time
 	}
 	return &s, nil
 }
 
 func (d *DB) ListSites() ([]Site, error) {
 	rows, err := d.conn.Query(`
-        SELECT site, domain, COALESCE(custom_domain,''), status, COALESCE(job_id,''), created_at, updated_at
+        SELECT site, domain, COALESCE(custom_domain,''), status, COALESCE(job_id,''), created_at, updated_at, last_backup_at
         FROM sites ORDER BY created_at DESC
     `)
 	if err != nil {
@@ -117,8 +139,12 @@ func (d *DB) ListSites() ([]Site, error) {
 	var sites []Site
 	for rows.Next() {
 		var s Site
-		if err := rows.Scan(&s.Site, &s.Domain, &s.CustomDomain, &s.Status, &s.JobID, &s.CreatedAt, &s.UpdatedAt); err != nil {
+		var lastBackup sql.NullTime
+		if err := rows.Scan(&s.Site, &s.Domain, &s.CustomDomain, &s.Status, &s.JobID, &s.CreatedAt, &s.UpdatedAt, &lastBackup); err != nil {
 			return nil, err
+		}
+		if lastBackup.Valid {
+			s.LastBackupAt = &lastBackup.Time
 		}
 		sites = append(sites, s)
 	}

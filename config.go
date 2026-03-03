@@ -38,6 +38,12 @@ type Config struct {
 	// Worker
 	WorkerPollInterval int // seconds
 	StuckJobTimeout    int // minutes
+
+	// Backup (R2 / Cloudflare)
+	R2AccountID       string
+	R2AccessKeyID     string
+	R2SecretAccessKey string
+	R2Bucket          string
 }
 
 func LoadConfig() Config {
@@ -60,6 +66,10 @@ func LoadConfig() Config {
 		ServiceTarget:         getEnv("TUNNEL_SERVICE_TARGET", "http://10.10.0.10:8080"),
 		WorkerPollInterval:    3,
 		StuckJobTimeout:       10,
+		R2AccountID:           getEnv("R2_ACCOUNT_ID", ""),
+		R2AccessKeyID:         getEnv("R2_ACCESS_KEY_ID", ""),
+		R2SecretAccessKey:     getEnv("R2_SECRET_ACCESS_KEY", ""),
+		R2Bucket:              getEnv("R2_BUCKET", "hostplane-backups"),
 	}
 }
 
