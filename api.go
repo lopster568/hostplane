@@ -16,14 +16,15 @@ import (
 var validSite = regexp.MustCompile(`^[a-z0-9]+$`)
 
 type API struct {
-	db     *DB
-	cfg    Config
-	docker *client.Client
-	tunnel *TunnelManager
+	db        *DB
+	cfg       Config
+	docker    *client.Client
+	tunnel    *TunnelManager
+	backupper *Backupper
 }
 
-func NewAPI(db *DB, cfg Config, docker *client.Client, tunnel *TunnelManager) *API {
-	return &API{db: db, cfg: cfg, docker: docker, tunnel: tunnel}
+func NewAPI(db *DB, cfg Config, docker *client.Client, tunnel *TunnelManager, backupper *Backupper) *API {
+	return &API{db: db, cfg: cfg, docker: docker, tunnel: tunnel, backupper: backupper}
 }
 
 // POST /api/sites/:site/domain
@@ -347,6 +348,9 @@ func (a *API) RegisterRoutes(r *gin.Engine) {
 		v1.DELETE("/sites/:site/domain", a.handleRemoveCustomDomain)
 		v1.GET("/sites/:site/domain/status", a.handleDomainStatus)
 		v1.POST("/sites/:site/cert-retry", a.handleCertRetry)
+		v1.POST("/sites/:site/backup", a.handleBackupSite)
+		v1.GET("/sites/:site/backups", a.handleListBackups)
+		v1.POST("/sites/:site/restore/:date", a.handleRestoreSite)
 	}
 }
 
@@ -704,21 +708,122 @@ func (a *API) handleSiteStatus(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"site":          s.Site,
-		"domain":        s.Domain,
-		"custom_domain": s.CustomDomain,
-		"status":        s.Status,
-		"cert_status":   certStatus,
-		"warnings":      warnings,
-		"job_id":        s.JobID,
-		"created_at":    s.CreatedAt,
-		"updated_at":    s.UpdatedAt,
+		"site":           s.Site,
+		"domain":         s.Domain,
+		"custom_domain":  s.CustomDomain,
+		"status":         s.Status,
+		"cert_status":    certStatus,
+		"warnings":       warnings,
+		"job_id":         s.JobID,
+		"last_backup_at": s.LastBackupAt,
+		"created_at":     s.CreatedAt,
+		"updated_at":     s.UpdatedAt,
 	})
 }
 
 // GET /api/health
 func (a *API) handleHealth(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+// POST /api/sites/:site/backup
+//
+// Triggers an on-demand backup of both the database and volume for a site.
+// Runs synchronously — the response is returned once the backup is complete.
+func (a *API) handleBackupSite(c *gin.Context) {
+	site := c.Param("site")
+	if a.backupper.r2 == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "backup not configured (R2 credentials missing)"})
+		return
+	}
+	if _, err := a.db.GetSite(site); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "site not found"})
+		return
+	}
+	if err := a.backupper.BackupSite(site); err != nil {
+		log.Printf("[api] backup failed site=%s: %v", site, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"site": site, "status": "backed_up", "date": dateStamp()})
+}
+
+// GET /api/sites/:site/backups
+//
+// Lists all available backup entries for the site in R2.
+// Returns separate database and volume entries with dates and sizes.
+func (a *API) handleListBackups(c *gin.Context) {
+	site := c.Param("site")
+	if a.backupper.r2 == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "backup not configured (R2 credentials missing)"})
+		return
+	}
+	if _, err := a.db.GetSite(site); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "site not found"})
+		return
+	}
+	ctx := c.Request.Context()
+
+	dbEntries, err := a.backupper.r2.List(ctx, prefixForSiteDB(site))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "cannot list DB backups: " + err.Error()})
+		return
+	}
+	volEntries, err := a.backupper.r2.List(ctx, prefixForSiteVolume(site))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "cannot list volume backups: " + err.Error()})
+		return
+	}
+
+	type backupItem struct {
+		Date string `json:"date"`
+		Type string `json:"type"`
+		Key  string `json:"key"`
+		Size int64  `json:"size_bytes"`
+	}
+	var items []backupItem
+	for _, e := range dbEntries {
+		items = append(items, backupItem{Date: dateFromKey(e.Key), Type: "database", Key: e.Key, Size: e.Size})
+	}
+	for _, e := range volEntries {
+		items = append(items, backupItem{Date: dateFromKey(e.Key), Type: "volume", Key: e.Key, Size: e.Size})
+	}
+	if items == nil {
+		items = []backupItem{} // return [] not null
+	}
+
+	c.JSON(http.StatusOK, gin.H{"site": site, "backups": items})
+}
+
+// POST /api/sites/:site/restore/:date
+//
+// Restores both the database and volume from the backup taken on :date (YYYY-MM-DD).
+// Runs synchronously — the response is returned once both restores complete.
+// The site's running containers are NOT stopped automatically; quiesce writes
+// first for a fully consistent restore.
+func (a *API) handleRestoreSite(c *gin.Context) {
+	site := c.Param("site")
+	date := c.Param("date")
+
+	if a.backupper.r2 == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "backup not configured (R2 credentials missing)"})
+		return
+	}
+	if !dateRe.MatchString(date) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid date format — expected YYYY-MM-DD"})
+		return
+	}
+	if _, err := a.db.GetSite(site); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "site not found"})
+		return
+	}
+
+	if err := a.backupper.RestoreSite(site, date); err != nil {
+		log.Printf("[api] restore failed site=%s date=%s: %v", site, date, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"site": site, "date": date, "status": "restored"})
 }
 
 // authMiddleware validates the X-API-Key header on every request

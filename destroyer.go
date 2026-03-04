@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/docker/docker/api/types"
@@ -12,15 +13,27 @@ import (
 )
 
 type Destroyer struct {
-	docker *client.Client
-	cfg    Config
+	docker    *client.Client
+	cfg       Config
+	backupper *Backupper
 }
 
-func NewDestroyer(docker *client.Client, cfg Config) *Destroyer {
-	return &Destroyer{docker: docker, cfg: cfg}
+func NewDestroyer(docker *client.Client, cfg Config, backupper *Backupper) *Destroyer {
+	return &Destroyer{docker: docker, cfg: cfg, backupper: backupper}
 }
 
 func (d *Destroyer) Run(site string) error {
+	// ── Pre-destroy safety backup ─────────────────────────────────
+	// Enabled by default. Set REQUIRE_BACKUP_BEFORE_DESTROY=false to skip
+	// during development / debugging when R2 is not yet configured.
+	if d.cfg.RequireBackupBeforeDestroy {
+		if err := d.backupper.BackupSite(site); err != nil {
+			return fmt.Errorf("pre-destroy backup failed, aborting destroy: %w", err)
+		}
+	} else {
+		log.Printf("[destroyer] site=%s REQUIRE_BACKUP_BEFORE_DESTROY=false — skipping pre-destroy backup", site)
+	}
+
 	dbName := WPDatabaseName(site)
 	dbUser := WPDatabaseUser(site)
 	volumeName := VolumeName(site)

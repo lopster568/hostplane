@@ -23,6 +23,13 @@ func main() {
 	}
 	log.Println("[main] connected to control DB")
 
+	// ── Schema migration ────────────────────────────────────
+	if err := db.MigrateSchema(); err != nil {
+		log.Printf("[main] schema migration warning: %v", err)
+		// non-fatal — column may already exist on older MySQL versions that
+		// don't support IF NOT EXISTS on ALTER TABLE
+	}
+
 	// ── Docker client (TLS to app-01) ────────────────────────────────
 	docker, err := client.NewClientWithOpts(
 		client.WithHost(cfg.DockerHost),
@@ -46,14 +53,27 @@ func main() {
 	}
 	log.Printf("[main] connected to docker on app-01 (containers: %d)", info.Containers)
 
-	// ── Wire up components ───────────────────────────────────────────
+	// ── R2 backup client ─────────────────────────────────
+	r2, r2Err := NewR2Client(cfg)
+	if r2Err != nil {
+		log.Printf("[main] R2 not configured (%v) — backups disabled", r2Err)
+	}
+
+	// ── Wire up components ───────────────────────────────
 	tunnel := NewTunnelManager(cfg)
 	provisioner := NewProvisioner(docker, cfg)
 	staticProvisioner := NewStaticProvisioner(docker, cfg)
-	destroyer := NewDestroyer(docker, cfg)
+	backupper := NewBackupper(docker, cfg, r2, db)
+	destroyer := NewDestroyer(docker, cfg, backupper)
 	worker := NewWorker(db, provisioner, destroyer, staticProvisioner, cfg)
 	go worker.Start()
 	log.Println("[main] worker started")
+
+	if r2 != nil {
+		backupWorker := NewBackupWorker(backupper, cfg)
+		go backupWorker.Start()
+		log.Println("[main] backup worker started")
+	}
 
 	// ── HTTP API ─────────────────────────────────────────────────────
 	gin.SetMode(gin.ReleaseMode)
@@ -61,7 +81,7 @@ func main() {
 	router.Use(gin.Logger())
 	router.Use(gin.Recovery())
 
-	api := NewAPI(db, cfg, docker, tunnel)
+	api := NewAPI(db, cfg, docker, tunnel, backupper)
 	api.RegisterRoutes(router)
 
 	srv := &http.Server{
